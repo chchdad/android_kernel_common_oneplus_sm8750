@@ -175,7 +175,7 @@ int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 	}
 
 	if (!test_bit(effect->type, ff->ffbit)) {
-		ret = compat_effect(ff, ff, effect);
+		ret = compat_effect(ff, effect);
 		if (ret)
 			return ret;
 	}
