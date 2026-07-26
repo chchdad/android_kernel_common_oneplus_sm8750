@@ -293,31 +293,22 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		break;
 
 	default:
-		/* ---- 核心并轨（手柄与手机同震）与绝对防崩溃隔离 ---- */
+		/* ---- 核心并轨（手柄与手机同震）与绝对防死锁隔离 ---- */
 		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->playback) {
 			
-			/* 无论一加传什么畸形code，咱们只用手柄最安全的0号内存槽 */
 			if (active_gamepad->ff->max_effects > 0) {
-				struct ff_effect forced_effect;
-				int safe_id = 0; 
-				
-				memset(&forced_effect, 0, sizeof(forced_effect));
-				forced_effect.type = FF_RUMBLE;
-				forced_effect.id = safe_id;
+				/* 【看门狗死锁修复】：绝对禁止在这里调用 upload()！
+				   直接暴力篡改手柄的 0 号内存槽位，只赋值，不阻塞！ */
+				active_gamepad->ff->effects[0].type = FF_RUMBLE;
+				active_gamepad->ff->effects[0].id = 0;
 				
 				/* value非0代表启动，直接给满级推背感；等于0代表停止 */
-				forced_effect.u.rumble.strong_magnitude = (value > 0) ? 0xFFFF : 0;
-				forced_effect.u.rumble.weak_magnitude = (value > 0) ? 0xFFFF : 0;
+				active_gamepad->ff->effects[0].u.rumble.strong_magnitude = (value > 0) ? 0xFFFF : 0;
+				active_gamepad->ff->effects[0].u.rumble.weak_magnitude = (value > 0) ? 0xFFFF : 0;
 				
-				/* 强制写入0号安全槽位 */
-				if (active_gamepad->ff->upload)
-					active_gamepad->ff->upload(active_gamepad, &forced_effect, NULL);
-				active_gamepad->ff->effects[safe_id] = forced_effect;
-				
-				/* 播放0号槽位，完美避开越界黑屏 */
-				active_gamepad->ff->playback(active_gamepad, safe_id, value);
+				/* 内存篡改完毕，直接按快车道规矩执行播放 */
+				active_gamepad->ff->playback(active_gamepad, 0, value);
 			}
-			/* 此处删除了原有的 return 0; 指令将继续下发至原厂手机马达，实现双重震动且不卡死 */
 		}
 
 		/* ---- 原机马达继续通电 ---- */
