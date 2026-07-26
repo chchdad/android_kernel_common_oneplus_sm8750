@@ -13,7 +13,7 @@
 #include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
-
+struct input_dev *active_gamepad = NULL;
 /*
  * Check that the effect_id is a valid effect and whether the user
  * is the owner
@@ -156,6 +156,11 @@ int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 	ff->effect_owners[id] = file;
 	spin_unlock_irq(&dev->event_lock);
 
+    if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->upload) {
+		active_gamepad->ff->upload(active_gamepad, effect, NULL);
+		active_gamepad->ff->effects[id] = *effect;
+	 }
+	
  out:
 	mutex_unlock(&ff->mutex);
 	return ret;
@@ -279,6 +284,13 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		break;
 
 	default:
+
+		/* ---- 核心变轨阻断 ---- */
+		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->playback) {
+			active_gamepad->ff->playback(active_gamepad, code, value);
+			return 0; /* 强制拦截：手柄震动，直接 return 断掉手机马达的通电指令 */
+		}
+		
 		if (check_effect_access(ff, code, NULL) == 0)
 			ff->playback(dev, code, value);
 		break;
@@ -346,7 +358,11 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 	/* we can emulate RUMBLE with periodic effects */
 	if (test_bit(FF_PERIODIC, ff->ffbit))
 		__set_bit(FF_RUMBLE, dev->ffbit);
-
+	
+    if (dev->name && (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller"))) {
+		active_gamepad = dev;
+		printk(KERN_INFO "FF_CORE: Caught Gamepad %s\n", dev->name);
+	}
 	return 0;
 }
 EXPORT_SYMBOL_GPL(input_ff_create);
@@ -362,7 +378,12 @@ EXPORT_SYMBOL_GPL(input_ff_create);
 void input_ff_destroy(struct input_dev *dev)
 {
 	struct ff_device *ff = dev->ff;
-
+	
+    if (dev == active_gamepad) {
+		active_gamepad = NULL;
+		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
+	}
+	
 	__clear_bit(EV_FF, dev->evbit);
 	if (ff) {
 		if (ff->destroy)
