@@ -15,9 +15,35 @@
 #include <linux/overflow.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 
-/* ---- 强行变轨全局指针 ---- */
+/* ---- 强行变轨全局指针与异步队列 ---- */
 struct input_dev *active_gamepad = NULL;
+static int gamepad_rumble_value = 0;
+static int gamepad_effect_id = -1;
+
+static void gamepad_rumble_worker(struct work_struct *work)
+{
+	struct ff_effect effect;
+	int val = gamepad_rumble_value;
+
+	if (!active_gamepad || !active_gamepad->ff)
+		return;
+
+	memset(&effect, 0, sizeof(effect));
+	effect.type = FF_RUMBLE;
+	effect.id = gamepad_effect_id;
+	effect.u.rumble.strong_magnitude = (val > 0) ? 0xFFFF : 0;
+	effect.u.rumble.weak_magnitude = (val > 0) ? 0xFFFF : 0;
+
+	/* 走正规流程分配底层物理内存，安全无死锁 */
+	if (input_ff_upload(active_gamepad, &effect, NULL) == 0) {
+		gamepad_effect_id = effect.id;
+		/* 标准触发：正数为播放，0为停止 */
+		input_ff_event(active_gamepad, EV_FF, gamepad_effect_id, (val > 0) ? 1 : 0);
+	}
+}
+static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
 
 /*
  * Check that the effect_id is a valid effect and whether the user
@@ -293,22 +319,10 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		break;
 
 	default:
-		/* ---- 核心并轨（手柄与手机同震）与绝对防死锁隔离 ---- */
-		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->playback) {
-			
-			if (active_gamepad->ff->max_effects > 0) {
-				/* 【看门狗死锁修复】：绝对禁止在这里调用 upload()！
-				   直接暴力篡改手柄的 0 号内存槽位，只赋值，不阻塞！ */
-				active_gamepad->ff->effects[0].type = FF_RUMBLE;
-				active_gamepad->ff->effects[0].id = 0;
-				
-				/* value非0代表启动，直接给满级推背感；等于0代表停止 */
-				active_gamepad->ff->effects[0].u.rumble.strong_magnitude = (value > 0) ? 0xFFFF : 0;
-				active_gamepad->ff->effects[0].u.rumble.weak_magnitude = (value > 0) ? 0xFFFF : 0;
-				
-				/* 内存篡改完毕，直接按快车道规矩执行播放 */
-				active_gamepad->ff->playback(active_gamepad, 0, value);
-			}
+		/* ---- 核心并轨（工作队列完全异步，零干扰隔离） ---- */
+		if (active_gamepad && dev != active_gamepad) {
+			gamepad_rumble_value = value;
+			schedule_work(&gamepad_rumble_work);
 		}
 
 		/* ---- 原机马达继续通电 ---- */
@@ -382,6 +396,7 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 	/* ---- 抓取手柄设备 ---- */
 	if (dev->name && (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller"))) {
 		active_gamepad = dev;
+		gamepad_effect_id = -1;
 		printk(KERN_INFO "FF_CORE: Caught Gamepad %s\n", dev->name);
 	}
 
@@ -401,9 +416,11 @@ void input_ff_destroy(struct input_dev *dev)
 {
 	struct ff_device *ff = dev->ff;
 
-	/* ---- 拔掉手柄时释放指针 ---- */
+	/* ---- 拔掉手柄时释放指针并销毁队列任务 ---- */
 	if (dev == active_gamepad) {
+		cancel_work_sync(&gamepad_rumble_work);
 		active_gamepad = NULL;
+		gamepad_effect_id = -1;
 		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
 	}
 
