@@ -16,6 +16,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 
+/* ---- 强行变轨全局指针 ---- */
 struct input_dev *active_gamepad = NULL;
 
 /*
@@ -160,12 +161,25 @@ int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 	ff->effect_owners[id] = file;
 	spin_unlock_irq(&dev->event_lock);
 
-	/* ---- 强行镜像特效参数给手柄 ---- */
-	if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->upload) {
-		active_gamepad->ff->upload(active_gamepad, effect, NULL);
-		active_gamepad->ff->effects[id] = *effect;
+	/* ---- 强行镜像并[翻译]特效参数给手柄 (含致命防呆) ---- */
+	if (active_gamepad && dev != active_gamepad && active_gamepad->ff) {
+		struct ff_effect forced_effect = *effect;
+		
+		/* 强行把一加的高级波形，翻译成 Xbox 傻瓜双马达震动 */
+		forced_effect.type = FF_RUMBLE;
+		forced_effect.u.rumble.strong_magnitude = 0xc000; /* 重马达力道 */
+		forced_effect.u.rumble.weak_magnitude = 0xc000;   /* 轻马达力道 */
+		
+		/* 致命防呆：防止马达特效ID超出手柄上限导致死机黑屏 */
+		if (id < active_gamepad->ff->max_effects) {
+			if (active_gamepad->ff->upload)
+				active_gamepad->ff->upload(active_gamepad, &forced_effect, NULL);
+			active_gamepad->ff->effects[id] = forced_effect;
+		} else {
+			printk(KERN_WARNING "FF_CORE_DEBUG: 警告! 特效ID %d 超出手柄上限\n", id);
+		}
 	}
-	
+
  out:
 	mutex_unlock(&ff->mutex);
 	return ret;
@@ -210,10 +224,6 @@ static int erase_effect(struct input_dev *dev, int effect_id,
  * @dev: input device to erase effect from
  * @effect_id: id of the effect to be erased
  * @file: purported owner of the request
- *
- * This function erases a force-feedback effect from specified device.
- * The effect will only be erased if it was uploaded through the same
- * file handle that is requesting erase.
  */
 int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file)
 {
@@ -233,12 +243,6 @@ EXPORT_SYMBOL_GPL(input_ff_erase);
 
 /*
  * input_ff_flush - erase all effects owned by a file handle
- * @dev: input device to erase effect from
- * @file: purported owner of the effects
- *
- * This function erases all force-feedback effects associated with
- * the given owner from specified device. Note that @file may be %NULL,
- * in which case all effects will be erased.
  */
 int input_ff_flush(struct input_dev *dev, struct file *file)
 {
@@ -260,25 +264,26 @@ EXPORT_SYMBOL_GPL(input_ff_flush);
 
 /**
  * input_ff_event() - generic handler for force-feedback events
- * @dev: input device to send the effect to
- * @type: event type (anything but EV_FF is ignored)
- * @code: event code
- * @value: event value
  */
 int input_ff_event(struct input_dev *dev, unsigned int type,
 		   unsigned int code, int value)
 {
 	struct ff_device *ff = dev->ff;
-	
-    /* ---- 咱们的硬核内核探针 ---- */
+
+	/* ---- 咱们的硬核内核探针 ---- */
 	printk(KERN_INFO "FF_CORE_DEBUG: 收到震动指令! 设备名: %s, code: %u, 强度value: %d\n",
 	       dev->name ? dev->name : "未知", code, value);
-	
+
 	if (type != EV_FF)
 		return 0;
 
 	switch (code) {
 	case FF_GAIN:
+		/* ---- 连带劫持音量指令，同步给手柄 ---- */
+		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->set_gain) {
+			active_gamepad->ff->set_gain(active_gamepad, value);
+		}
+
 		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
 
@@ -293,13 +298,12 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		break;
 
 	default:
-
 		/* ---- 核心变轨阻断 ---- */
 		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->playback) {
 			active_gamepad->ff->playback(active_gamepad, code, value);
 			return 0; /* 强制拦截：手柄震动，直接 return 断掉手机马达的通电指令 */
 		}
-		
+
 		if (check_effect_access(ff, code, NULL) == 0)
 			ff->playback(dev, code, value);
 		break;
@@ -311,14 +315,6 @@ EXPORT_SYMBOL_GPL(input_ff_event);
 
 /**
  * input_ff_create() - create force-feedback device
- * @dev: input device supporting force-feedback
- * @max_effects: maximum number of effects supported by the device
- *
- * This function allocates all necessary memory for a force feedback
- * portion of an input device and installs all default handlers.
- * @dev->ffbit should be already set up before calling this function.
- * Once ff device is created you need to setup its upload, erase,
- * playback and other handlers before registering input device
  */
 int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 {
@@ -367,34 +363,29 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 	if (test_bit(FF_PERIODIC, ff->ffbit))
 		__set_bit(FF_RUMBLE, dev->ffbit);
 
-    /* ---- 抓取手柄设备 ---- */
+	/* ---- 抓取手柄设备 ---- */
 	if (dev->name && (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller"))) {
 		active_gamepad = dev;
 		printk(KERN_INFO "FF_CORE: Caught Gamepad %s\n", dev->name);
 	}
-	
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(input_ff_create);
 
 /**
  * input_ff_destroy() - frees force feedback portion of input device
- * @dev: input device supporting force feedback
- *
- * This function is only needed in error path as input core will
- * automatically free force feedback structures when device is
- * destroyed.
  */
 void input_ff_destroy(struct input_dev *dev)
 {
 	struct ff_device *ff = dev->ff;
-	
-    /* ---- 拔掉手柄时释放指针 ---- */
+
+	/* ---- 拔掉手柄时释放指针 ---- */
 	if (dev == active_gamepad) {
 		active_gamepad = NULL;
 		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
 	}
-	
+
 	__clear_bit(EV_FF, dev->evbit);
 	if (ff) {
 		if (ff->destroy)
