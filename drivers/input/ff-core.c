@@ -16,6 +16,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <linux/sysrq.h>
 
 /* ---- 强行变轨全局指针与异步队列 ---- */
 struct input_dev *active_gamepad = NULL;
@@ -29,7 +30,7 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	int ret;
 
 	if (!active_gamepad || !active_gamepad->ff) {
-		printk(KERN_ERR "FF_CORE_PROBE: [失败] active_gamepad 为空或无力反馈支持\n");
+		printk(KERN_ERR "FF_CORE_PROBE: [失败] active_gamepad 为空\n");
 		return;
 	}
 
@@ -38,30 +39,40 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	effect.id = gamepad_effect_id;
 	effect.u.rumble.strong_magnitude = (val > 0) ? 0xFFFF : 0;
 	effect.u.rumble.weak_magnitude = (val > 0) ? 0xFFFF : 0;
-
+	
 	/* 
-	 * 【修复所有权Bug】：传入 (struct file *)1 作为伪造的 owner。
-	 * 否则内核系统会把这个特效当成“孤儿”，在回放时强行拦截。
+	 * 【致命BUG修复】：赋予震动持续时间！
+	 * 2000 代表持续 2000 毫秒 (2秒)。非0时才给时长，0为停止。
 	 */
+	effect.replay.length = (val > 0) ? 2000 : 0;
+	effect.replay.delay = 0;
+
 	ret = input_ff_upload(active_gamepad, &effect, (struct file *)1);
 	
 	if (ret == 0) {
 		gamepad_effect_id = effect.id;
-		printk(KERN_INFO "FF_CORE_PROBE: [成功] 特效上传成功(id=%d), 尝试触发回放 (val=%d)\n", effect.id, val);
+		printk(KERN_INFO "FF_CORE_PROBE: [成功] 特效上传(id=%d), 回放(val=%d)\n", effect.id, val);
 		
-		/* 绕过复杂的 input_ff_event，直接呼叫底层驱动的回放函数，最简单粗暴 */
 		if (active_gamepad->ff->playback) {
 			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, (val > 0) ? 1 : 0);
-			printk(KERN_INFO "FF_CORE_PROBE: [成功] 底层 playback 执行完毕\n");
-		} else {
-			printk(KERN_ERR "FF_CORE_PROBE: [失败] 手柄没有注册 playback 函数\n");
 		}
-	} else {
-		printk(KERN_ERR "FF_CORE_PROBE: [失败] 特效上传被拒绝, 错误码: %d\n", ret);
 	}
 }
-
 static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
+
+/* ---- 专属内核调试指令 (SysRq) ---- */
+static void sysrq_handle_gamepad_vib(int key)
+{
+	printk(KERN_INFO "FF_CORE_PROBE: 收到 SysRq 调试指令，强制触发手柄震动!\n");
+	gamepad_rumble_value = 1;
+	schedule_work(&gamepad_rumble_work);
+}
+static const struct sysrq_key_op sysrq_gamepad_vib_op = {
+	.handler = sysrq_handle_gamepad_vib,
+	.help_msg = "vibrate-gamepad(v)",
+	.action_msg = "Trigger Gamepad Vibration",
+	.enable_mask = SYSRQ_ENABLE_DUMP,
+};
 
 /*
  * Check that the effect_id is a valid effect and whether the user
@@ -413,11 +424,11 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 
 	/* ---- 抓取手柄设备探针 ---- */
 	if (dev->name) {
-		printk(KERN_INFO "FF_CORE_PROBE: 发现支持力反馈的设备, 名字叫: %s\n", dev->name);
-		/* 如果你的手柄名字很奇怪，可以在这里继续加 || strstr(dev->name, "你的手柄关键字") */
 		if (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller")) {
 			active_gamepad = dev;
 			gamepad_effect_id = -1;
+			/* 手柄接入时，注册 SysRq 'v' 指令 */
+			register_sysrq_key('v', &sysrq_gamepad_vib_op);
 			printk(KERN_INFO "FF_CORE_PROBE: [成功] 成功抓取手柄设备!\n");
 		}
 	}
@@ -440,6 +451,8 @@ void input_ff_destroy(struct input_dev *dev)
 
 	/* ---- 拔掉手柄时释放指针并销毁队列任务 ---- */
 	if (dev == active_gamepad) {
+		/* 注销 SysRq 指令，防止空指针调用 */
+		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
 		cancel_work_sync(&gamepad_rumble_work);
 		active_gamepad = NULL;
 		gamepad_effect_id = -1;
