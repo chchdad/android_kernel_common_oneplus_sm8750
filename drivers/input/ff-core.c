@@ -47,6 +47,7 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	effect.replay.length = (val > 0) ? 2000 : 0;
 	effect.replay.delay = 0;
 
+	/* 传入 (struct file *)1 作为伪造的 owner，规避孤儿特效拦截 */
 	ret = input_ff_upload(active_gamepad, &effect, (struct file *)1);
 	
 	if (ret == 0) {
@@ -56,6 +57,8 @@ static void gamepad_rumble_worker(struct work_struct *work)
 		if (active_gamepad->ff->playback) {
 			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, (val > 0) ? 1 : 0);
 		}
+	} else {
+		printk(KERN_ERR "FF_CORE_PROBE: [失败] 特效上传被拒绝, 错误码: %d\n", ret);
 	}
 }
 static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
@@ -172,7 +175,7 @@ int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 	}
 
 	if (!test_bit(effect->type, ff->ffbit)) {
-		ret = compat_effect(ff, effect);
+		ret = compat_effect(ff, ff, effect);
 		if (ret)
 			return ret;
 	}
