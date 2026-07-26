@@ -293,6 +293,13 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		break;
 
 	default:
+
+		/* ---- 核心变轨阻断 ---- */
+		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->playback) {
+			active_gamepad->ff->playback(active_gamepad, code, value);
+			return 0; /* 强制拦截：手柄震动，直接 return 断掉手机马达的通电指令 */
+		}
+		
 		if (check_effect_access(ff, code, NULL) == 0)
 			ff->playback(dev, code, value);
 		break;
