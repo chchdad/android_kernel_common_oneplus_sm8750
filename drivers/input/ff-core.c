@@ -64,7 +64,7 @@ static void gamepad_rumble_worker(struct work_struct *work)
 static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
 
 /* ---- 专属内核调试指令 (SysRq) ---- */
-static void sysrq_handle_gamepad_vib(int key)
+static void sysrq_handle_gamepad_vib(u8 key)
 {
 	printk(KERN_INFO "FF_CORE_PROBE: 收到 SysRq 调试指令，强制触发手柄震动!\n");
 	gamepad_rumble_value = 1;
