@@ -16,6 +16,8 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 
+struct input_dev *active_gamepad = NULL;
+
 /*
  * Check that the effect_id is a valid effect and whether the user
  * is the owner
@@ -158,6 +160,12 @@ int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 	ff->effect_owners[id] = file;
 	spin_unlock_irq(&dev->event_lock);
 
+	/* ---- 强行镜像特效参数给手柄 ---- */
+	if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->upload) {
+		active_gamepad->ff->upload(active_gamepad, effect, NULL);
+		active_gamepad->ff->effects[id] = *effect;
+	}
+	
  out:
 	mutex_unlock(&ff->mutex);
 	return ret;
@@ -261,7 +269,11 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		   unsigned int code, int value)
 {
 	struct ff_device *ff = dev->ff;
-
+	
+    /* ---- 咱们的硬核内核探针 ---- */
+	printk(KERN_INFO "FF_CORE_DEBUG: 收到震动指令! 设备名: %s, code: %u, 强度value: %d\n",
+	       dev->name ? dev->name : "未知", code, value);
+	
 	if (type != EV_FF)
 		return 0;
 
@@ -348,6 +360,12 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 	if (test_bit(FF_PERIODIC, ff->ffbit))
 		__set_bit(FF_RUMBLE, dev->ffbit);
 
+    /* ---- 抓取手柄设备 ---- */
+	if (dev->name && (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller"))) {
+		active_gamepad = dev;
+		printk(KERN_INFO "FF_CORE: Caught Gamepad %s\n", dev->name);
+	}
+	
 	return 0;
 }
 EXPORT_SYMBOL_GPL(input_ff_create);
@@ -363,7 +381,13 @@ EXPORT_SYMBOL_GPL(input_ff_create);
 void input_ff_destroy(struct input_dev *dev)
 {
 	struct ff_device *ff = dev->ff;
-
+	
+    /* ---- 拔掉手柄时释放指针 ---- */
+	if (dev == active_gamepad) {
+		active_gamepad = NULL;
+		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
+	}
+	
 	__clear_bit(EV_FF, dev->evbit);
 	if (ff) {
 		if (ff->destroy)
