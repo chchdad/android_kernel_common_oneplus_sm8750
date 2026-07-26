@@ -161,25 +161,6 @@ int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 	ff->effect_owners[id] = file;
 	spin_unlock_irq(&dev->event_lock);
 
-	/* ---- 强行镜像并[翻译]特效参数给手柄 (含致命防呆) ---- */
-	if (active_gamepad && dev != active_gamepad && active_gamepad->ff) {
-		struct ff_effect forced_effect = *effect;
-		
-		/* 强行把一加的高级波形，翻译成 Xbox 傻瓜双马达震动 */
-		forced_effect.type = FF_RUMBLE;
-		forced_effect.u.rumble.strong_magnitude = 0xc000; /* 重马达力道 */
-		forced_effect.u.rumble.weak_magnitude = 0xc000;   /* 轻马达力道 */
-		
-		/* 致命防呆：防止马达特效ID超出手柄上限导致死机黑屏 */
-		if (id < active_gamepad->ff->max_effects) {
-			if (active_gamepad->ff->upload)
-				active_gamepad->ff->upload(active_gamepad, &forced_effect, NULL);
-			active_gamepad->ff->effects[id] = forced_effect;
-		} else {
-			printk(KERN_WARNING "FF_CORE_DEBUG: 警告! 特效ID %d 超出手柄上限\n", id);
-		}
-	}
-
  out:
 	mutex_unlock(&ff->mutex);
 	return ret;
@@ -224,6 +205,10 @@ static int erase_effect(struct input_dev *dev, int effect_id,
  * @dev: input device to erase effect from
  * @effect_id: id of the effect to be erased
  * @file: purported owner of the request
+ *
+ * This function erases a force-feedback effect from specified device.
+ * The effect will only be erased if it was uploaded through the same
+ * file handle that is requesting erase.
  */
 int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file)
 {
@@ -243,6 +228,12 @@ EXPORT_SYMBOL_GPL(input_ff_erase);
 
 /*
  * input_ff_flush - erase all effects owned by a file handle
+ * @dev: input device to erase effect from
+ * @file: purported owner of the effects
+ *
+ * This function erases all force-feedback effects associated with
+ * the given owner from specified device. Note that @file may be %NULL,
+ * in which case all effects will be erased.
  */
 int input_ff_flush(struct input_dev *dev, struct file *file)
 {
@@ -264,6 +255,10 @@ EXPORT_SYMBOL_GPL(input_ff_flush);
 
 /**
  * input_ff_event() - generic handler for force-feedback events
+ * @dev: input device to send the effect to
+ * @type: event type (anything but EV_FF is ignored)
+ * @code: event code
+ * @value: event value
  */
 int input_ff_event(struct input_dev *dev, unsigned int type,
 		   unsigned int code, int value)
@@ -283,7 +278,7 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->set_gain) {
 			active_gamepad->ff->set_gain(active_gamepad, value);
 		}
-
+		
 		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
 
@@ -298,12 +293,34 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		break;
 
 	default:
-		/* ---- 核心变轨阻断 ---- */
+		/* ---- 核心并轨（手柄与手机同震）与绝对防崩溃隔离 ---- */
 		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->playback) {
-			active_gamepad->ff->playback(active_gamepad, code, value);
-			return 0; /* 强制拦截：手柄震动，直接 return 断掉手机马达的通电指令 */
+			
+			/* 无论一加传什么畸形code，咱们只用手柄最安全的0号内存槽 */
+			if (active_gamepad->ff->max_effects > 0) {
+				struct ff_effect forced_effect;
+				int safe_id = 0; 
+				
+				memset(&forced_effect, 0, sizeof(forced_effect));
+				forced_effect.type = FF_RUMBLE;
+				forced_effect.id = safe_id;
+				
+				/* value非0代表启动，直接给满级推背感；等于0代表停止 */
+				forced_effect.u.rumble.strong_magnitude = (value > 0) ? 0xFFFF : 0;
+				forced_effect.u.rumble.weak_magnitude = (value > 0) ? 0xFFFF : 0;
+				
+				/* 强制写入0号安全槽位 */
+				if (active_gamepad->ff->upload)
+					active_gamepad->ff->upload(active_gamepad, &forced_effect, NULL);
+				active_gamepad->ff->effects[safe_id] = forced_effect;
+				
+				/* 播放0号槽位，完美避开越界黑屏 */
+				active_gamepad->ff->playback(active_gamepad, safe_id, value);
+			}
+			/* 此处删除了原有的 return 0; 指令将继续下发至原厂手机马达，实现双重震动且不卡死 */
 		}
 
+		/* ---- 原机马达继续通电 ---- */
 		if (check_effect_access(ff, code, NULL) == 0)
 			ff->playback(dev, code, value);
 		break;
@@ -315,6 +332,14 @@ EXPORT_SYMBOL_GPL(input_ff_event);
 
 /**
  * input_ff_create() - create force-feedback device
+ * @dev: input device supporting force-feedback
+ * @max_effects: maximum number of effects supported by the device
+ *
+ * This function allocates all necessary memory for a force feedback
+ * portion of an input device and installs all default handlers.
+ * @dev->ffbit should be already set up before calling this function.
+ * Once ff device is created you need to setup its upload, erase,
+ * playback and other handlers before registering input device
  */
 int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 {
@@ -375,6 +400,11 @@ EXPORT_SYMBOL_GPL(input_ff_create);
 
 /**
  * input_ff_destroy() - frees force feedback portion of input device
+ * @dev: input device supporting force feedback
+ *
+ * This function is only needed in error path as input core will
+ * automatically free force feedback structures when device is
+ * destroyed.
  */
 void input_ff_destroy(struct input_dev *dev)
 {
