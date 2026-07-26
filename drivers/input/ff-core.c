@@ -264,7 +264,11 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		   unsigned int code, int value)
 {
 	struct ff_device *ff = dev->ff;
-
+	
+    /* ---- 内核探针 ---- */
+	printk(KERN_INFO "FF_CORE_DEBUG: 收到震动指令! 设备名: %s, code: %u, 强度value: %d\n",
+	       dev->name ? dev->name : "未知", code, value);
+	
 	if (type != EV_FF)
 		return 0;
 
