@@ -26,9 +26,12 @@ static void gamepad_rumble_worker(struct work_struct *work)
 {
 	struct ff_effect effect;
 	int val = gamepad_rumble_value;
+	int ret;
 
-	if (!active_gamepad || !active_gamepad->ff)
+	if (!active_gamepad || !active_gamepad->ff) {
+		printk(KERN_ERR "FF_CORE_PROBE: [失败] active_gamepad 为空或无力反馈支持\n");
 		return;
+	}
 
 	memset(&effect, 0, sizeof(effect));
 	effect.type = FF_RUMBLE;
@@ -36,13 +39,28 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	effect.u.rumble.strong_magnitude = (val > 0) ? 0xFFFF : 0;
 	effect.u.rumble.weak_magnitude = (val > 0) ? 0xFFFF : 0;
 
-	/* 走正规流程分配底层物理内存，安全无死锁 */
-	if (input_ff_upload(active_gamepad, &effect, NULL) == 0) {
+	/* 
+	 * 【修复所有权Bug】：传入 (struct file *)1 作为伪造的 owner。
+	 * 否则内核系统会把这个特效当成“孤儿”，在回放时强行拦截。
+	 */
+	ret = input_ff_upload(active_gamepad, &effect, (struct file *)1);
+	
+	if (ret == 0) {
 		gamepad_effect_id = effect.id;
-		/* 标准触发：正数为播放，0为停止 */
-		input_ff_event(active_gamepad, EV_FF, gamepad_effect_id, (val > 0) ? 1 : 0);
+		printk(KERN_INFO "FF_CORE_PROBE: [成功] 特效上传成功(id=%d), 尝试触发回放 (val=%d)\n", effect.id, val);
+		
+		/* 绕过复杂的 input_ff_event，直接呼叫底层驱动的回放函数，最简单粗暴 */
+		if (active_gamepad->ff->playback) {
+			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, (val > 0) ? 1 : 0);
+			printk(KERN_INFO "FF_CORE_PROBE: [成功] 底层 playback 执行完毕\n");
+		} else {
+			printk(KERN_ERR "FF_CORE_PROBE: [失败] 手柄没有注册 playback 函数\n");
+		}
+	} else {
+		printk(KERN_ERR "FF_CORE_PROBE: [失败] 特效上传被拒绝, 错误码: %d\n", ret);
 	}
 }
+
 static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
 
 /*
@@ -393,11 +411,15 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 	if (test_bit(FF_PERIODIC, ff->ffbit))
 		__set_bit(FF_RUMBLE, dev->ffbit);
 
-	/* ---- 抓取手柄设备 ---- */
-	if (dev->name && (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller"))) {
-		active_gamepad = dev;
-		gamepad_effect_id = -1;
-		printk(KERN_INFO "FF_CORE: Caught Gamepad %s\n", dev->name);
+	/* ---- 抓取手柄设备探针 ---- */
+	if (dev->name) {
+		printk(KERN_INFO "FF_CORE_PROBE: 发现支持力反馈的设备, 名字叫: %s\n", dev->name);
+		/* 如果你的手柄名字很奇怪，可以在这里继续加 || strstr(dev->name, "你的手柄关键字") */
+		if (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller")) {
+			active_gamepad = dev;
+			gamepad_effect_id = -1;
+			printk(KERN_INFO "FF_CORE_PROBE: [成功] 成功抓取手柄设备!\n");
+		}
 	}
 
 	return 0;
