@@ -288,7 +288,8 @@ static void ms_ff_worker(struct work_struct *work)
 	memset(r, 0, sizeof(*r));
 
 	r->report_id = XB1S_FF_REPORT;
-	r->enable = ENABLE_WEAK | ENABLE_STRONG;
+	/*r->enable = ENABLE_WEAK | ENABLE_STRONG;*/
+	r->enable = 0x0F;
 	/*
 	 * Specifying maximum duration and maximum loop count should
 	 * cover maximum duration of a single effect, which is 65536
@@ -448,6 +449,8 @@ static const struct hid_device_id ms_devices[] = {
 		.driver_data = MS_SURFACE_DIAL },
 
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708),
+		.driver_data = MS_QUIRK_FF },
+    { HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, 0x0B13),
 		.driver_data = MS_QUIRK_FF },
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708_BLE),
 		.driver_data = MS_QUIRK_FF },
