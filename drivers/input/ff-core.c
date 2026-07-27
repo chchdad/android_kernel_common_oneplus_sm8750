@@ -472,4 +472,13 @@ void input_ff_destroy(struct input_dev *dev)
 		dev->ff = NULL;
 	}
 }
+/* ---- 暴露给原机马达驱动的劫持接口 ---- */
+void trigger_gamepad_vib_from_system(int intensity)
+{
+	/* 只要手柄连着，且接收到原机马达的强度值大于0，就同步起震 */
+	if (active_gamepad) {
+		gamepad_rumble_value = (intensity > 0) ? 1 : 0;
+		schedule_work(&gamepad_rumble_work);
+	}
+}
 EXPORT_SYMBOL_GPL(input_ff_destroy);
