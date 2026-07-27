@@ -40,20 +40,24 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	effect.u.rumble.strong_magnitude = (val > 0) ? 0xFFFF : 0;
 	effect.u.rumble.weak_magnitude = (val > 0) ? 0xFFFF : 0;
 	
-	/* 改为 0xFFFF (约 65 秒)，只要游戏不发 0 停止，就一直震！ */
-	effect.replay.length = (val > 0) ? 0xFFFF : 0;
+	/* 改为 50  */
+	effect.replay.length = (val > 0) ? 50 : 0;
 
 	/* 传入 (struct file *)1 作为伪造的 owner，规避孤儿特效拦截 */
 	ret = input_ff_upload(active_gamepad, &effect, (struct file *)1);
 	
 	if (ret == 0) {
 		gamepad_effect_id = effect.id;
-		printk(KERN_INFO "FF_CORE_PROBE: [成功] 特效上传(id=%d), 回放(val=%d)\n", effect.id, val);
-		
+		/* 【修复】：删除了这里的 printk 成功提示，避免高频刷屏锁死 CPU */
 		if (active_gamepad->ff->playback) {
 			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, (val > 0) ? 1 : 0);
 		}
 	} else {
+		/* 【核心救命补丁】：一旦上传被拒绝(比如报 -22)，说明特效已被系统强行回收 */
+		/* 必须立刻重置为 -1，让它下一次乖乖重新申请新 ID！ */
+		/* 【绝对禁止】在这里写 printk，否则游戏一开枪系统必死机！ */
+		gamepad_effect_id = -1;
+	}
 		printk(KERN_ERR "FF_CORE_PROBE: [失败] 特效上传被拒绝, 错误码: %d\n", ret);
 	}
 }
