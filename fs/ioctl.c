@@ -49,25 +49,18 @@ long vfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	if (!filp->f_op->unlocked_ioctl)
 		goto out;
 
-	/* 👇 --- 极限安全跨界劫持开始 --- 👇 */
-	if (_IOC_DIR(cmd) & _IOC_WRITE) {
-		if (filp->f_path.dentry && filp->f_path.dentry->d_name.name) {
-			dname = filp->f_path.dentry->d_name.name;
-			if (dname[0] == 'h' || dname[0] == 'a') {
-				if (strstr(dname, "haptic") || strstr(dname, "aw869")) {
-					
-					/* 终极逻辑：如果手柄在线 (返回1)，直接 return 0 假装执行成功！
-					 * 此时 Linux 核心会直接抛弃这个 ioctl，手机马达绝对不会震。
-					 * 如果手柄不在线 (返回0)，if 不成立，指令正常放行给手机马达。 */
-					if (trigger_gamepad_vib_from_system(1) == 1) {
-						return 0; 
-					}
-					
-				}
-			}
+	/* 👇 --- 暴力劫持 RichTap 游戏震动私有协议 --- 👇 */
+	if ((cmd & 0xFF00) == 0x5200) {
+		/* 根据实机日志，0x5212 是停止指令，其余(0x5205/0x520a)视为持续震动 */
+		int intensity = (cmd == 0x5212) ? 0 : 1;
+		
+		/* 如果 trigger_gamepad_vib_from_system 返回 1，说明手柄已连上并接管 */
+		if (trigger_gamepad_vib_from_system(intensity) == 1) {
+			/* 直接返回 0 (执行成功)，把原生手机马达彻底“饿死”！ */
+			return 0; 
 		}
 	}
-	/* 👆 --- 极限安全跨界劫持结束 --- 👆 */
+	/* 👆 --- 暴力劫持结束 --- 👆 */
 
 	error = filp->f_op->unlocked_ioctl(filp, cmd, arg);
 	if (error == -ENOIOCTLCMD)
