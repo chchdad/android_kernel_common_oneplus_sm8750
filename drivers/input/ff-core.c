@@ -59,7 +59,6 @@ static void gamepad_rumble_worker(struct work_struct *work)
 		gamepad_effect_id = -1;
 	}
 		printk(KERN_ERR "FF_CORE_PROBE: [失败] 特效上传被拒绝, 错误码: %d\n", ret);
-	}
 }
 static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
 
