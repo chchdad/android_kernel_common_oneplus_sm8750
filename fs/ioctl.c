@@ -54,7 +54,7 @@ long vfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (filp->f_path.dentry && filp->f_path.dentry->d_name.name) {
 			dname = filp->f_path.dentry->d_name.name;
 			if (dname[0] == 'h' || dname[0] == 'a') {
-				if (strstr(dname, "haptic")) {
+				if (strstr(dname, "haptic") || strstr(dname, "aw869")) {
 					
 					/* 终极逻辑：如果手柄在线 (返回1)，直接 return 0 假装执行成功！
 					 * 此时 Linux 核心会直接抛弃这个 ioctl，手机马达绝对不会震。
