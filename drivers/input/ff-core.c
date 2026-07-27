@@ -23,11 +23,28 @@ struct input_dev *active_gamepad = NULL;
 static int gamepad_rumble_value = 0;
 static int gamepad_effect_id = -1;
 
+/* ---- 新增：强制刹车延时任务 ---- */
+static void gamepad_stop_worker(struct work_struct *work)
+{
+	unsigned long flags;
+	/* 强行给底层发送 0 (断电) 指令 */
+	if (active_gamepad && active_gamepad->ff && gamepad_effect_id != -1) {
+		spin_lock_irqsave(&active_gamepad->event_lock, flags);
+		if (active_gamepad->ff->playback) {
+			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, 0);
+		}
+		spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
+	}
+}
+static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
+/* -------------------------------- */
+
 static void gamepad_rumble_worker(struct work_struct *work)
 {
 	struct ff_effect effect;
 	int val = gamepad_rumble_value;
 	int ret;
+	unsigned long flags; /* 新增：用于保存内核中断状态的自旋锁变量 */
 
 	if (!active_gamepad || !active_gamepad->ff) {
 		printk(KERN_ERR "FF_CORE_PROBE: [失败] active_gamepad 为空\n");
@@ -48,14 +65,27 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	
 	if (ret == 0) {
 		gamepad_effect_id = effect.id;
-		/* 【修复】：删除了这里的 printk 成功提示，避免高频刷屏锁死 CPU */
-		if (active_gamepad->ff->playback) {
+		
+		/* 1. 发送通电指令 (1) */
+		spin_lock_irqsave(&active_gamepad->event_lock, flags);
+		if (active_gamepad->ff && active_gamepad->ff->playback) {
 			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, (val > 0) ? 1 : 0);
 		}
+		spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
+
+		/* 2. 【核心刹车逻辑】：开启倒计时 */
+		if (val > 0) {
+			/* 只要开枪，就重置 120 毫秒的倒计时。
+			 * 如果是步枪连发，这里会以极快的频率不断刷新倒计时，保持连震；
+			 * 一旦停火超过 120 毫秒，gamepad_stop_worker 就会被触发，强制拔电源！ */
+			mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(120));
+		} else {
+			/* 如果游戏破天荒地发了停止指令，取消刹车任务 */
+			cancel_delayed_work(&gamepad_stop_work);
+		}
+		
 	} else {
-		/* 【核心救命补丁】：一旦上传被拒绝(比如报 -22)，说明特效已被系统强行回收 */
-		/* 必须立刻重置为 -1，让它下一次乖乖重新申请新 ID！ */
-		/* 【绝对禁止】在这里写 printk，否则游戏一开枪系统必死机！ */
+		/* 一旦报错 -22，立刻重置 ID 重新申请 */
 		gamepad_effect_id = -1;
 	}
 		printk(KERN_ERR "FF_CORE_PROBE: [失败] 特效上传被拒绝, 错误码: %d\n", ret);
