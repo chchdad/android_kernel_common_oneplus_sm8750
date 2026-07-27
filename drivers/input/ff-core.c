@@ -44,7 +44,7 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	 * 【致命BUG修复】：赋予震动持续时间！
 	 * 2000 代表持续 2000 毫秒 (2秒)。非0时才给时长，0为停止。
 	 */
-	effect.replay.length = (val > 0) ? 2000 : 0;
+	effect.replay.length = (val > 0) ? 50 : 0;
 	effect.replay.delay = 0;
 
 	/* 传入 (struct file *)1 作为伪造的 owner，规避孤儿特效拦截 */
@@ -473,12 +473,14 @@ void input_ff_destroy(struct input_dev *dev)
 	}
 }
 /* ---- 暴露给原机马达驱动的劫持接口 ---- */
-void trigger_gamepad_vib_from_system(int intensity)
+int trigger_gamepad_vib_from_system(int intensity)
 {
-	/* 只要手柄连着，且接收到原机马达的强度值大于0，就同步起震 */
+	/* 只要手柄连着，就接管震动并返回 1 */
 	if (active_gamepad) {
 		gamepad_rumble_value = (intensity > 0) ? 1 : 0;
 		schedule_work(&gamepad_rumble_work);
+		return 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
 	}
+	return 0; /* 手柄没连，放行指令给原机马达 */
 }
 EXPORT_SYMBOL_GPL(input_ff_destroy);
