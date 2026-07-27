@@ -26,7 +26,7 @@
 #include "internal.h"
 
 #include <asm/ioctls.h>
-extern void trigger_gamepad_vib_from_system(int intensity);
+extern int trigger_gamepad_vib_from_system(int intensity);
 /* So that the fiemap access checks can't overflow on 32 bit machines. */
 #define FIEMAP_MAX_EXTENTS	(UINT_MAX / sizeof(struct fiemap_extent))
 
@@ -49,18 +49,25 @@ long vfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	if (!filp->f_op->unlocked_ioctl)
 		goto out;
 
-	/* 👇 --- [新增] 极限安全跨界劫持开始 --- 👇 */
+	/* 👇 --- 极限安全跨界劫持开始 --- 👇 */
 	if (_IOC_DIR(cmd) & _IOC_WRITE) {
 		if (filp->f_path.dentry && filp->f_path.dentry->d_name.name) {
 			dname = filp->f_path.dentry->d_name.name;
 			if (dname[0] == 'h' || dname[0] == 'a') {
 				if (strstr(dname, "haptic")) {
-					trigger_gamepad_vib_from_system(1);
+					
+					/* 终极逻辑：如果手柄在线 (返回1)，直接 return 0 假装执行成功！
+					 * 此时 Linux 核心会直接抛弃这个 ioctl，手机马达绝对不会震。
+					 * 如果手柄不在线 (返回0)，if 不成立，指令正常放行给手机马达。 */
+					if (trigger_gamepad_vib_from_system(1) == 1) {
+						return 0; 
+					}
+					
 				}
 			}
 		}
 	}
-	/* 👆 --- [新增] 极限安全跨界劫持结束 --- 👆 */
+	/* 👆 --- 极限安全跨界劫持结束 --- 👆 */
 
 	error = filp->f_op->unlocked_ioctl(filp, cmd, arg);
 	if (error == -ENOIOCTLCMD)
