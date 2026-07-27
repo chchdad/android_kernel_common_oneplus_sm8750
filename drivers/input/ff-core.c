@@ -40,12 +40,8 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	effect.u.rumble.strong_magnitude = (val > 0) ? 0xFFFF : 0;
 	effect.u.rumble.weak_magnitude = (val > 0) ? 0xFFFF : 0;
 	
-	/* 
-	 * 【致命BUG修复】：赋予震动持续时间！
-	 * 2000 代表持续 2000 毫秒 (2秒)。非0时才给时长，0为停止。
-	 */
-	effect.replay.length = (val > 0) ? 50 : 0;
-	effect.replay.delay = 0;
+	/* 改为 0xFFFF (约 65 秒)，只要游戏不发 0 停止，就一直震！ */
+	effect.replay.length = (val > 0) ? 0xFFFF : 0;
 
 	/* 传入 (struct file *)1 作为伪造的 owner，规避孤儿特效拦截 */
 	ret = input_ff_upload(active_gamepad, &effect, (struct file *)1);
