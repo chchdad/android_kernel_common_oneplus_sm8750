@@ -20,37 +20,43 @@
 
 /* ---- 强行变轨全局指针与异步队列 ---- */
 struct input_dev *active_gamepad = NULL;
-static int gamepad_rumble_value = 0;
 static int gamepad_effect_id = -1;
-static DEFINE_MUTEX(gamepad_mutex); 
+
+/* 【终极修复1】：设立一次性上传 Worker，仅在手柄连接时执行一次，绝不干扰游戏过程 */
+static void gamepad_upload_worker(struct work_struct *work)
+{
+	struct ff_effect effect;
+	if (!active_gamepad || !active_gamepad->ff) return;
+
+	memset(&effect, 0, sizeof(effect));
+	effect.type = FF_RUMBLE;
+	effect.id = -1;
+	effect.u.rumble.strong_magnitude = 0xFFFF;
+	effect.u.rumble.weak_magnitude = 0xFFFF;
+	/* 遵循确认：50ms时长的纯粹震感 */
+	effect.replay.length = 50; 
+
+	if (input_ff_upload(active_gamepad, &effect, (struct file *)1) == 0) {
+		gamepad_effect_id = effect.id;
+	}
+}
+static DECLARE_WORK(gamepad_upload_work, gamepad_upload_worker);
 
 /* ---- 强制刹车延时任务 ---- */
 static void gamepad_stop_worker(struct work_struct *work)
 {
 	unsigned long flags;
-	struct input_dev *dev;
-
-	mutex_lock(&gamepad_mutex);
-	dev = active_gamepad;
-	if (dev) {
-		input_get_device(dev); /* 拿到引用 */
-	}
-	mutex_unlock(&gamepad_mutex);
-
-	if (dev) {
-		if (dev->ff && gamepad_effect_id != -1) {
-			spin_lock_irqsave(&dev->event_lock, flags);
-			if (dev->ff->playback) {
-				dev->ff->playback(dev, gamepad_effect_id, 0);
-			}
-			spin_unlock_irqrestore(&dev->event_lock, flags);
+	struct input_dev *dev = active_gamepad; 
+	
+	if (dev && dev->ff && gamepad_effect_id != -1) {
+		spin_lock_irqsave(&dev->event_lock, flags);
+		if (dev->ff->playback) {
+			dev->ff->playback(dev, gamepad_effect_id, 0);
 		}
-		/* 无论上面进没进 if，只要 dev 存在，这里绝对执行 put！ */
-		input_put_device(dev); 
+		spin_unlock_irqrestore(&dev->event_lock, flags);
 	}
 }
 static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
-
 /* -------------------------------- */
 
 static void gamepad_rumble_worker(struct work_struct *work)
@@ -119,8 +125,7 @@ static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
 static void sysrq_handle_gamepad_vib(u8 key)
 {
 	printk(KERN_INFO "FF_CORE_PROBE: 收到 SysRq 调试指令，强制触发手柄震动!\n");
-	gamepad_rumble_value = 1;
-	schedule_work(&gamepad_rumble_work);
+	trigger_gamepad_vib_from_system(1);
 }
 static const struct sysrq_key_op sysrq_gamepad_vib_op = {
 	.handler = sysrq_handle_gamepad_vib,
@@ -375,47 +380,46 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 {
 	struct ff_device *ff = dev->ff;
 
-	/* ---- 咱们的硬核内核探针 ---- */
-	printk(KERN_INFO "FF_CORE_DEBUG: 收到震动指令! 设备名: %s, code: %u, 强度value: %d\n",
-	       dev->name ? dev->name : "未知", code, value);
-
 	if (type != EV_FF)
 		return 0;
 
 	switch (code) {
 	case FF_GAIN:
-		/* ---- 连带劫持音量指令，同步给手柄 ---- */
 		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->set_gain) {
 			active_gamepad->ff->set_gain(active_gamepad, value);
 		}
-		
 		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
-
 		ff->set_gain(dev, value);
 		break;
 
 	case FF_AUTOCENTER:
 		if (!test_bit(FF_AUTOCENTER, dev->ffbit) || value > 0xffffU)
 			break;
-
 		ff->set_autocenter(dev, value);
 		break;
 
 	default:
-		/* ---- 核心并轨（工作队列完全异步，零干扰隔离） ---- */
+		/* ---- 核心并轨（拦截原生马达，同步驱动手柄） ---- */
 		if (active_gamepad && dev != active_gamepad) {
-			gamepad_rumble_value = value;
-			schedule_work(&gamepad_rumble_work);
-			
-			/* 【终极静音防线】：只要手柄在线，截获指令并直接返回 0 (成功)。
-			 * 这样原生马达的 playback 就被彻底架空，手机绝对不会震！ */
+			unsigned long flags;
+			if (gamepad_effect_id != -1 && active_gamepad->ff && active_gamepad->ff->playback) {
+				/* 同步极速调用，与内核原生安全机制保持100%一致 */
+				spin_lock_irqsave(&active_gamepad->event_lock, flags);
+				active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, value > 0 ? 1 : 0);
+				spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
+
+				if (value > 0) {
+					mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
+				} else {
+					cancel_delayed_work(&gamepad_stop_work);
+				}
+			}
+			/* 【终极静音防线】：只要手柄连着，就截断指令并返回0，手机绝对不震！ */
 			return 0; 
 		}
 
 		/* ---- 原机马达继续通电 ---- */
-		/* 如果拔掉了手柄 (active_gamepad 为 NULL)，上面那个 if 就不会成立。
-		 * 逻辑会畅通无阻地走到这里，手机原生马达完美恢复工作！ */
 		if (check_effect_access(ff, code, NULL) == 0)
 			ff->playback(dev, code, value);
 		break;
@@ -488,7 +492,8 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 		if (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller")) {
 			active_gamepad = dev;
 			gamepad_effect_id = -1;
-			/* 手柄接入时，注册 SysRq 'v' 指令 */
+			/* 连接时立刻异步上传特效，一劳永逸！ */
+			schedule_work(&gamepad_upload_work);
 			register_sysrq_key('v', &sysrq_gamepad_vib_op);
 			printk(KERN_INFO "FF_CORE_PROBE: [成功] 成功抓取手柄设备!\n");
 		}
@@ -512,22 +517,14 @@ void input_ff_destroy(struct input_dev *dev)
 
 	/* ---- 拔掉手柄时释放指针并销毁队列任务 ---- */
 	if (dev == active_gamepad) {
-		/* 【核心修复：防并发死机】先上锁，瞬间把全局指针置空！ */
-		/* 这就等于物理拔电源，此后任何 vfs_ioctl 或 input_ff_event 都无法再触发新任务 */
-		mutex_lock(&gamepad_mutex);
+		/* 【终极修复2】：瞬间置空并立刻放行！绝不使用 _sync 阻塞底层硬件销毁！ */
 		active_gamepad = NULL;
 		gamepad_effect_id = -1;
-		mutex_unlock(&gamepad_mutex); /* 【致命细节】：必须立刻解锁！绝不能包住下面的 cancel 函数 */
+		
+		cancel_work(&gamepad_upload_work);
+		cancel_delayed_work(&gamepad_stop_work);
 		
 		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
-		
-		/* 此时指针已空，绝对不会有新任务产生。 */
-		/* 在不上锁的状态下，安心等待残留的异步任务（带着引用计数）安全结束 */
-		cancel_work_sync(&gamepad_rumble_work);
-		
-		/* 【核心修复2】：强制销毁延时刹车任务，防止异步越界导致内核死机！ */
-		cancel_delayed_work_sync(&gamepad_stop_work);
-		
 		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
 	}
 
@@ -545,10 +542,17 @@ void input_ff_destroy(struct input_dev *dev)
 /* ---- 暴露给原机马达驱动的劫持接口 ---- */
 int trigger_gamepad_vib_from_system(int intensity)
 {
-	/* 只要手柄连着，就接管震动并返回 1 */
-	if (active_gamepad) {
-		gamepad_rumble_value = (intensity > 0) ? 1 : 0;
-		schedule_work(&gamepad_rumble_work);
+	unsigned long flags;
+	if (active_gamepad && gamepad_effect_id != -1) {
+		spin_lock_irqsave(&active_gamepad->event_lock, flags);
+		if (active_gamepad->ff && active_gamepad->ff->playback) {
+			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, intensity > 0 ? 1 : 0);
+		}
+		spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
+		
+		if (intensity > 0) mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
+		else cancel_delayed_work(&gamepad_stop_work);
+		
 		return 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
 	}
 	return 0; /* 手柄没连，放行指令给原机马达 */
