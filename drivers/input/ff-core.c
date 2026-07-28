@@ -22,32 +22,59 @@
 struct input_dev *active_gamepad = NULL;
 static int gamepad_rumble_value = 0;
 static int gamepad_effect_id = -1;
-static DEFINE_MUTEX(gamepad_mutex); /* 新增：互斥锁，用于安全管理手柄状态 */
+static DEFINE_MUTEX(gamepad_mutex); 
 
-/* ---- 强制刹车延时任务 ---- */
+/* ---- 新增：强制刹车延时任务 ---- */
 static void gamepad_stop_worker(struct work_struct *work)
 {
+	unsigned long flags;
+	struct input_dev *dev;
+
 	mutex_lock(&gamepad_mutex);
-	if (active_gamepad && active_gamepad->ff && gamepad_effect_id != -1) {
-		/* 直接调用，不上自旋锁，完美避开高通死锁！ */
-		if (active_gamepad->ff->playback) {
-			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, 0);
-		}
+	dev = active_gamepad;
+	/* 【核心修复】：增加内核引用计数，防止运行期间手柄被物理销毁 */
+	if (dev) {
+		input_get_device(dev);
 	}
 	mutex_unlock(&gamepad_mutex);
+
+	if (dev) {
+		if (dev->ff && gamepad_effect_id != -1) {
+			spin_lock_irqsave(&dev->event_lock, flags);
+			if (dev->ff->playback) {
+				dev->ff->playback(dev, gamepad_effect_id, 0);
+			}
+			spin_unlock_irqrestore(&dev->event_lock, flags);
+		}
+		/* 任务执行完毕，释放引用计数 */
+		input_put_device(dev);
+	}
 }
 static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
+/* -------------------------------- */
 
 static void gamepad_rumble_worker(struct work_struct *work)
 {
 	struct ff_effect effect;
 	int val = gamepad_rumble_value;
 	int ret;
+	unsigned long flags; 
+	struct input_dev *dev;
 
 	mutex_lock(&gamepad_mutex);
-	if (!active_gamepad || !active_gamepad->ff) {
-		mutex_unlock(&gamepad_mutex);
+	dev = active_gamepad;
+	/* 【核心修复】：同样加上引用计数护身符 */
+	if (dev) {
+		input_get_device(dev);
+	}
+	mutex_unlock(&gamepad_mutex);
+
+	if (!dev) {
 		return;
+	}
+
+	if (!dev->ff) {
+		goto out_put; /* 安全退出通道 */
 	}
 
 	if (gamepad_effect_id == -1) {
@@ -58,20 +85,20 @@ static void gamepad_rumble_worker(struct work_struct *work)
 		effect.u.rumble.weak_magnitude = 0xFFFF;
 		effect.replay.length = 50; 
 
-		ret = input_ff_upload(active_gamepad, &effect, (struct file *)1);
+		ret = input_ff_upload(dev, &effect, (struct file *)1);
 		if (ret == 0) {
 			gamepad_effect_id = effect.id;
 		} else {
-			mutex_unlock(&gamepad_mutex);
-			return; 
+			goto out_put; 
 		}
 	}
 
 	if (gamepad_effect_id != -1) {
-		/* 去掉自旋锁，直接裸调，把烫手山芋扔给底层自己解决 */
-		if (active_gamepad->ff && active_gamepad->ff->playback) {
-			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, (val > 0) ? 1 : 0);
+		spin_lock_irqsave(&dev->event_lock, flags);
+		if (dev->ff && dev->ff->playback) {
+			dev->ff->playback(dev, gamepad_effect_id, (val > 0) ? 1 : 0);
 		}
+		spin_unlock_irqrestore(&dev->event_lock, flags);
 
 		if (val > 0) {
 			mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
@@ -79,7 +106,10 @@ static void gamepad_rumble_worker(struct work_struct *work)
 			cancel_delayed_work(&gamepad_stop_work);
 		}
 	}
-	mutex_unlock(&gamepad_mutex);
+
+out_put:
+	/* 任务结束，释放设备引用 */
+	input_put_device(dev);
 }
 static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
 
@@ -481,14 +511,22 @@ void input_ff_destroy(struct input_dev *dev)
 
 	/* ---- 拔掉手柄时释放指针并销毁队列任务 ---- */
 	if (dev == active_gamepad) {
-		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
-		cancel_work_sync(&gamepad_rumble_work);
-		
-		/* 【核心修复2】：必须强制销毁延时刹车任务，防止异步越界导致内核死机！ */
-		cancel_delayed_work_sync(&gamepad_stop_work);
-		
+		/* 【核心修复：防并发死机】先上锁，瞬间把全局指针置空！ */
+		/* 这就等于物理拔电源，此后任何 vfs_ioctl 或 input_ff_event 都无法再触发新任务 */
+		mutex_lock(&gamepad_mutex);
 		active_gamepad = NULL;
 		gamepad_effect_id = -1;
+		mutex_unlock(&gamepad_mutex); /* 【致命细节】：必须立刻解锁！绝不能包住下面的 cancel 函数 */
+		
+		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
+		
+		/* 此时指针已空，绝对不会有新任务产生。 */
+		/* 在不上锁的状态下，安心等待残留的异步任务（带着引用计数）安全结束 */
+		cancel_work_sync(&gamepad_rumble_work);
+		
+		/* 【核心修复2】：强制销毁延时刹车任务，防止异步越界导致内核死机！ */
+		cancel_delayed_work_sync(&gamepad_stop_work);
+		
 		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
 	}
 
@@ -502,6 +540,7 @@ void input_ff_destroy(struct input_dev *dev)
 		dev->ff = NULL;
 	}
 }
+
 /* ---- 暴露给原机马达驱动的劫持接口 ---- */
 int trigger_gamepad_vib_from_system(int intensity)
 {
