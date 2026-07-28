@@ -44,46 +44,47 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	struct ff_effect effect;
 	int val = gamepad_rumble_value;
 	int ret;
-	unsigned long flags; /* 新增：用于保存内核中断状态的自旋锁变量 */
+	unsigned long flags; 
 
 	if (!active_gamepad || !active_gamepad->ff) {
-		printk(KERN_ERR "FF_CORE_PROBE: [失败] active_gamepad 为空\n");
 		return;
 	}
 
-	memset(&effect, 0, sizeof(effect));
-	effect.type = FF_RUMBLE;
-	effect.id = gamepad_effect_id;
-	effect.u.rumble.strong_magnitude = (val > 0) ? 0xFFFF : 0;
-	effect.u.rumble.weak_magnitude = (val > 0) ? 0xFFFF : 0;
-	
-	/* 改为 50  */
-	effect.replay.length = (val > 0) ? 50 : 0;
-
-	/* 传入 (struct file *)1 作为伪造的 owner，规避孤儿特效拦截 */
-	ret = input_ff_upload(active_gamepad, &effect, (struct file *)1);
-	
-	if (ret == 0) {
-		gamepad_effect_id = effect.id;
+	/* 【核心修复1】：只在第一次申请时上传，避开类型突变导致的 -22 拒绝！ */
+	if (gamepad_effect_id == -1) {
+		memset(&effect, 0, sizeof(effect));
+		effect.type = FF_RUMBLE;
+		effect.id = -1;
+		effect.u.rumble.strong_magnitude = 0xFFFF;
+		effect.u.rumble.weak_magnitude = 0xFFFF;
 		
-		/* 1. 发送通电指令 (1) */
+		/* 严格按要求：时间固定使用 50 毫秒 */
+		effect.replay.length = 50; 
+
+		ret = input_ff_upload(active_gamepad, &effect, (struct file *)1);
+		if (ret == 0) {
+			gamepad_effect_id = effect.id;
+		} else {
+			return; /* 上传失败直接退出，绝对不要设为 -1 破坏后续逻辑 */
+		}
+	}
+
+	/* 只要 ID 有效，直接受控通电并刷新刹车倒计时 */
+	if (gamepad_effect_id != -1) {
 		spin_lock_irqsave(&active_gamepad->event_lock, flags);
 		if (active_gamepad->ff && active_gamepad->ff->playback) {
 			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, (val > 0) ? 1 : 0);
 		}
 		spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
 
-		/* 2. 【核心刹车逻辑】：开启倒计时 */
+		/* 开启 50 毫秒自动刹车倒计时 */
 		if (val > 0) {
-			/* 只要开枪，就重置 120 毫秒的倒计时。
-			 * 如果是步枪连发，这里会以极快的频率不断刷新倒计时，保持连震；
-			 * 一旦停火超过 120 毫秒，gamepad_stop_worker 就会被触发，强制拔电源！ */
-			mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(120));
+			mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
 		} else {
-			/* 如果游戏破天荒地发了停止指令，取消刹车任务 */
 			cancel_delayed_work(&gamepad_stop_work);
 		}
-		
+	}
+}
 	} else {
 		/* 一旦报错 -22，立刻重置 ID 重新申请 */
 		gamepad_effect_id = -1;
@@ -483,9 +484,12 @@ void input_ff_destroy(struct input_dev *dev)
 
 	/* ---- 拔掉手柄时释放指针并销毁队列任务 ---- */
 	if (dev == active_gamepad) {
-		/* 注销 SysRq 指令，防止空指针调用 */
 		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
 		cancel_work_sync(&gamepad_rumble_work);
+		
+		/* 【核心修复2】：必须强制销毁延时刹车任务，防止异步越界导致内核死机！ */
+		cancel_delayed_work_sync(&gamepad_stop_work);
+		
 		active_gamepad = NULL;
 		gamepad_effect_id = -1;
 		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
