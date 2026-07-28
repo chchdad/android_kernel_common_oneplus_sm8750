@@ -39,7 +39,6 @@ static void gamepad_upload_worker(struct work_struct *work)
 	effect.id = -1;
 	effect.u.rumble.strong_magnitude = 0xFFFF;
 	effect.u.rumble.weak_magnitude = 0xFFFF;
-	/* 遵循确认：50ms时长的纯粹震感 */
 	effect.replay.length = 50; 
 
 	if (input_ff_upload(active_gamepad, &effect, (struct file *)1) == 0) {
@@ -473,7 +472,7 @@ void input_ff_destroy(struct input_dev *dev)
 		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
 		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
 	}
-
+	
 	__clear_bit(EV_FF, dev->evbit);
 	if (ff) {
 		if (ff->destroy)
@@ -503,4 +502,4 @@ int trigger_gamepad_vib_from_system(int intensity)
 	}
 	return 0; /* 手柄没连，放行指令给原机马达 */
 }
-EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system);
+EXPORT_SYMBOL_GPL(input_ff_destroy);
