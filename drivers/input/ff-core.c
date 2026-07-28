@@ -376,9 +376,15 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		if (active_gamepad && dev != active_gamepad) {
 			gamepad_rumble_value = value;
 			schedule_work(&gamepad_rumble_work);
+			
+			/* 【终极静音防线】：只要手柄在线，截获指令并直接返回 0 (成功)。
+			 * 这样原生马达的 playback 就被彻底架空，手机绝对不会震！ */
+			return 0; 
 		}
 
 		/* ---- 原机马达继续通电 ---- */
+		/* 如果拔掉了手柄 (active_gamepad 为 NULL)，上面那个 if 就不会成立。
+		 * 逻辑会畅通无阻地走到这里，手机原生马达完美恢复工作！ */
 		if (check_effect_access(ff, code, NULL) == 0)
 			ff->playback(dev, code, value);
 		break;
