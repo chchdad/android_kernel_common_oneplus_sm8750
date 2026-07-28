@@ -323,19 +323,32 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		   unsigned int code, int value)
 {
 	struct ff_device *ff = dev->ff;
+	unsigned long flags;
 
 	if (type != EV_FF)
 		return 0;
 
-	/* 【终极生死防线】：拦截已经被销毁的指针（防拔出手柄瞬间的 UAF 死机） */
+	/* 【核心防线】：如果底层驱动内存已被销毁（手柄拔出），直接丢弃指令！
+	 * 绝对不能让空指针流到下面的 check_effect_access 去，否则必定引发 0x40 偏移崩溃！ */
 	if (!ff)
 		return 0;
 
 	switch (code) {
 	case FF_GAIN:
-		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->set_gain) {
-			active_gamepad->ff->set_gain(active_gamepad, value);
+		spin_lock_irqsave(&active_gamepad_lock, flags);
+		if (active_gamepad && dev != active_gamepad) {
+			struct input_dev *gp_dev = active_gamepad;
+			atomic_inc(&gamepad_ff_usage);
+			spin_unlock_irqrestore(&active_gamepad_lock, flags);
+
+			if (gp_dev->ff && gp_dev->ff->set_gain) {
+				gp_dev->ff->set_gain(gp_dev, value);
+			}
+			atomic_dec(&gamepad_ff_usage);
+		} else {
+			spin_unlock_irqrestore(&active_gamepad_lock, flags);
 		}
+
 		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
 		if (ff->set_gain) ff->set_gain(dev, value);
@@ -349,30 +362,39 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 
 	default:
 		/* ---- 核心并轨（拦截原生马达，同步驱动手柄） ---- */
+		spin_lock_irqsave(&active_gamepad_lock, flags);
 		if (active_gamepad && dev != active_gamepad) {
-			unsigned long flags;
-			if (gamepad_effect_id != -1 && active_gamepad->ff && active_gamepad->ff->playback) {
-				spin_lock_irqsave(&active_gamepad->event_lock, flags);
-				active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, value > 0 ? 1 : 0);
-				spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
+			struct input_dev *gp_dev = active_gamepad;
+			
+			if (gamepad_effect_id != -1) {
+				atomic_inc(&gamepad_ff_usage);
+				spin_unlock_irqrestore(&active_gamepad_lock, flags);
+
+				spin_lock_irqsave(&gp_dev->event_lock, flags);
+				if (gp_dev->ff && gp_dev->ff->playback) {
+					gp_dev->ff->playback(gp_dev, gamepad_effect_id, value > 0 ? 1 : 0);
+				}
+				spin_unlock_irqrestore(&gp_dev->event_lock, flags);
 
 				if (value > 0) {
 					mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
 				} else {
 					cancel_delayed_work(&gamepad_stop_work);
 				}
+				
+				atomic_dec(&gamepad_ff_usage);
+			} else {
+				spin_unlock_irqrestore(&active_gamepad_lock, flags);
 			}
-			/* 【终极静音防线】：只要手柄连着，就截断指令并返回0，手机绝对不震！ */
+			/* 只要手柄连着，截断指令并返回，手机不震 */
 			return 0; 
 		}
+		spin_unlock_irqrestore(&active_gamepad_lock, flags);
 
 		/* ---- 原机马达继续通电 ---- */
-		/* 恢复原汁原味的原生安全校验，把马达还给手机！ */
-		if (check_effect_access(ff, code, NULL) == 0) {
-			if (ff->playback) {
-				ff->playback(dev, code, value);
-			}
-		}
+		/* 保持内核原始逻辑，不做任何自作聪明的删改！保证手机原生马达正常发威！ */
+		if (check_effect_access(ff, code, NULL) == 0)
+			ff->playback(dev, code, value);
 		break;
 	}
 
