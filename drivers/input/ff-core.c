@@ -422,14 +422,12 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 	if (dev->name) {
 		if (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller")) {
 			active_gamepad = dev;
-			gamepad_effect_id = -1;
-			/* 【核心修复2】：绝不能立刻上传！延迟 1000 毫秒，等驱动把指针全部挂载完毕 */
-			schedule_delayed_work(&gamepad_upload_work, msecs_to_jiffies(1000));
+			gamepad_effect_id = 0; /* 霸占 0 号槽位，不调用任何上传函数 */
 			register_sysrq_key('v', &sysrq_gamepad_vib_op);
-			printk(KERN_INFO "FF_CORE_PROBE: [成功] 成功抓取手柄设备!\n");
+			printk(KERN_INFO "FF_CORE_PROBE: [成功] 成功抓取手柄设备，已开启纯净拦截模式!\n");
 		}
 	}
-
+	
 	return 0;
 }
 EXPORT_SYMBOL_GPL(input_ff_create);
