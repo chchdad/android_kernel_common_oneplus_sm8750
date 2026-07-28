@@ -327,6 +327,10 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 	if (type != EV_FF)
 		return 0;
 
+	/* 【终极生死防线】：拦截已经被销毁的指针（防拔出手柄瞬间的 UAF 死机） */
+	if (!ff)
+		return 0;
+
 	switch (code) {
 	case FF_GAIN:
 		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->set_gain) {
@@ -334,13 +338,13 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		}
 		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
-		if (ff && ff->set_gain) ff->set_gain(dev, value);
+		if (ff->set_gain) ff->set_gain(dev, value);
 		break;
 
 	case FF_AUTOCENTER:
 		if (!test_bit(FF_AUTOCENTER, dev->ffbit) || value > 0xffffU)
 			break;
-		if (ff && ff->set_autocenter) ff->set_autocenter(dev, value);
+		if (ff->set_autocenter) ff->set_autocenter(dev, value);
 		break;
 
 	default:
@@ -363,9 +367,12 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		}
 
 		/* ---- 原机马达继续通电 ---- */
-		/* 【核心修复】：彻底移除导致空指针崩溃的 check_effect_access，恢复内核原生标准判定 */
-		if (ff && ff->playback && test_bit(code, ff->ffbit))
-			ff->playback(dev, code, value);
+		/* 恢复原汁原味的原生安全校验，把马达还给手机！ */
+		if (check_effect_access(ff, code, NULL) == 0) {
+			if (ff->playback) {
+				ff->playback(dev, code, value);
+			}
+		}
 		break;
 	}
 
