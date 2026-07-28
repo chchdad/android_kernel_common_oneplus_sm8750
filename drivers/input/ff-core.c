@@ -22,70 +22,67 @@
 struct input_dev *active_gamepad = NULL;
 static int gamepad_rumble_value = 0;
 static int gamepad_effect_id = -1;
+static DEFINE_MUTEX(gamepad_mutex); /* 新增：互斥锁，用于安全管理手柄状态 */
 
-/* ---- 新增：强制刹车延时任务 ---- */
+/* ---- 强制刹车延时任务 ---- */
 static void gamepad_stop_worker(struct work_struct *work)
 {
-	unsigned long flags;
-	/* 强行给底层发送 0 (断电) 指令 */
+	mutex_lock(&gamepad_mutex);
 	if (active_gamepad && active_gamepad->ff && gamepad_effect_id != -1) {
-		spin_lock_irqsave(&active_gamepad->event_lock, flags);
+		/* 直接调用，不上自旋锁，完美避开高通死锁！ */
 		if (active_gamepad->ff->playback) {
 			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, 0);
 		}
-		spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
 	}
+	mutex_unlock(&gamepad_mutex);
 }
 static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
-/* -------------------------------- */
 
 static void gamepad_rumble_worker(struct work_struct *work)
 {
 	struct ff_effect effect;
 	int val = gamepad_rumble_value;
 	int ret;
-	unsigned long flags; 
 
+	mutex_lock(&gamepad_mutex);
 	if (!active_gamepad || !active_gamepad->ff) {
+		mutex_unlock(&gamepad_mutex);
 		return;
 	}
 
-	/* 【核心修复1】：只在第一次申请时上传，避开类型突变导致的 -22 拒绝！ */
 	if (gamepad_effect_id == -1) {
 		memset(&effect, 0, sizeof(effect));
 		effect.type = FF_RUMBLE;
 		effect.id = -1;
 		effect.u.rumble.strong_magnitude = 0xFFFF;
 		effect.u.rumble.weak_magnitude = 0xFFFF;
-		
-		/* 严格按要求：时间固定使用 50 毫秒 */
 		effect.replay.length = 50; 
 
 		ret = input_ff_upload(active_gamepad, &effect, (struct file *)1);
 		if (ret == 0) {
 			gamepad_effect_id = effect.id;
 		} else {
-			return; /* 上传失败直接退出，绝对不要设为 -1 破坏后续逻辑 */
+			mutex_unlock(&gamepad_mutex);
+			return; 
 		}
 	}
 
-	/* 只要 ID 有效，直接受控通电并刷新刹车倒计时 */
 	if (gamepad_effect_id != -1) {
-		spin_lock_irqsave(&active_gamepad->event_lock, flags);
+		/* 去掉自旋锁，直接裸调，把烫手山芋扔给底层自己解决 */
 		if (active_gamepad->ff && active_gamepad->ff->playback) {
 			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, (val > 0) ? 1 : 0);
 		}
-		spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
 
-		/* 开启 50 毫秒自动刹车倒计时 */
 		if (val > 0) {
 			mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
 		} else {
 			cancel_delayed_work(&gamepad_stop_work);
 		}
 	}
+	mutex_unlock(&gamepad_mutex);
 }
 static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
+
 
 /* ---- 专属内核调试指令 (SysRq) ---- */
 static void sysrq_handle_gamepad_vib(u8 key)
