@@ -49,18 +49,27 @@ long vfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	if (!filp->f_op->unlocked_ioctl)
 		goto out;
 
-	/* 👇 --- 暴力劫持 RichTap 游戏震动私有协议 --- 👇 */
-	if ((cmd & 0xFF00) == 0x5200) {
-		/* 根据实机日志，0x5212 是停止指令，其余(0x5205/0x520a)视为持续震动 */
-		int intensity = (cmd == 0x5212) ? 0 : 1;
+	/* 👇 --- 精准狙击 RichTap 游戏震动私有协议 --- 👇 */
+	/* 1. 消除未使用变量问题：真正利用 dname 进行身份核验 */
+	if (filp->f_path.dentry && filp->f_path.dentry->d_name.name) {
+		dname = filp->f_path.dentry->d_name.name;
 		
-		/* 如果 trigger_gamepad_vib_from_system 返回 1，说明手柄已连上并接管 */
-		if (trigger_gamepad_vib_from_system(intensity) == 1) {
-			/* 直接返回 0 (执行成功)，把原生手机马达彻底“饿死”！ */
-			return 0; 
+		/* 2. 身份锁定：绝对不全局拦截！只拦截发给包含 haptic/qcom/vibrator/aw869 节点的指令 */
+		if (strstr(dname, "haptic") || strstr(dname, "qcom") || strstr(dname, "vibrator") || strstr(dname, "aw869")) {
+			
+			/* 3. 精确匹配：废除宽泛的 0xFF00 掩码，采用全字精确匹配，绝不误杀系统 IOCTL */
+			if (cmd == 0x5205 || cmd == 0x520a || cmd == 0x5212) {
+				/* 0x5212 为刹车指令 */
+				int intensity = (cmd == 0x5212) ? 0 : 1;
+				
+				/* 如果手柄接管，返回 0 骗过系统，饿死物理马达 */
+				if (trigger_gamepad_vib_from_system(intensity) == 1) {
+					return 0; 
+				}
+			}
 		}
 	}
-	/* 👆 --- 暴力劫持结束 --- 👆 */
+	/* 👆 --- 精准狙击结束 --- 👆 */
 
 	error = filp->f_op->unlocked_ioctl(filp, cmd, arg);
 	if (error == -ENOIOCTLCMD)
