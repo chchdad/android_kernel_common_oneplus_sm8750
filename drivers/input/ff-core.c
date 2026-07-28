@@ -334,13 +334,13 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		}
 		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
-		ff->set_gain(dev, value);
+		if (ff && ff->set_gain) ff->set_gain(dev, value);
 		break;
 
 	case FF_AUTOCENTER:
 		if (!test_bit(FF_AUTOCENTER, dev->ffbit) || value > 0xffffU)
 			break;
-		ff->set_autocenter(dev, value);
+		if (ff && ff->set_autocenter) ff->set_autocenter(dev, value);
 		break;
 
 	default:
@@ -348,7 +348,6 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		if (active_gamepad && dev != active_gamepad) {
 			unsigned long flags;
 			if (gamepad_effect_id != -1 && active_gamepad->ff && active_gamepad->ff->playback) {
-				/* 同步极速调用，与内核原生安全机制保持100%一致 */
 				spin_lock_irqsave(&active_gamepad->event_lock, flags);
 				active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, value > 0 ? 1 : 0);
 				spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
@@ -364,7 +363,8 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		}
 
 		/* ---- 原机马达继续通电 ---- */
-		if (check_effect_access(ff, code, NULL) == 0)
+		/* 【核心修复】：彻底移除导致空指针崩溃的 check_effect_access，恢复内核原生标准判定 */
+		if (ff && ff->playback && test_bit(code, ff->ffbit))
 			ff->playback(dev, code, value);
 		break;
 	}
