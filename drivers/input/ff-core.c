@@ -24,7 +24,7 @@ static int gamepad_rumble_value = 0;
 static int gamepad_effect_id = -1;
 static DEFINE_MUTEX(gamepad_mutex); 
 
-/* ---- 新增：强制刹车延时任务 ---- */
+/* ---- 强制刹车延时任务 ---- */
 static void gamepad_stop_worker(struct work_struct *work)
 {
 	unsigned long flags;
@@ -32,9 +32,8 @@ static void gamepad_stop_worker(struct work_struct *work)
 
 	mutex_lock(&gamepad_mutex);
 	dev = active_gamepad;
-	/* 【核心修复】：增加内核引用计数，防止运行期间手柄被物理销毁 */
 	if (dev) {
-		input_get_device(dev);
+		input_get_device(dev); /* 拿到引用 */
 	}
 	mutex_unlock(&gamepad_mutex);
 
@@ -46,11 +45,12 @@ static void gamepad_stop_worker(struct work_struct *work)
 			}
 			spin_unlock_irqrestore(&dev->event_lock, flags);
 		}
-		/* 任务执行完毕，释放引用计数 */
-		input_put_device(dev);
+		/* 无论上面进没进 if，只要 dev 存在，这里绝对执行 put！ */
+		input_put_device(dev); 
 	}
 }
 static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
+
 /* -------------------------------- */
 
 static void gamepad_rumble_worker(struct work_struct *work)
@@ -63,18 +63,18 @@ static void gamepad_rumble_worker(struct work_struct *work)
 
 	mutex_lock(&gamepad_mutex);
 	dev = active_gamepad;
-	/* 【核心修复】：同样加上引用计数护身符 */
 	if (dev) {
-		input_get_device(dev);
+		input_get_device(dev); /* 拿到引用 */
 	}
 	mutex_unlock(&gamepad_mutex);
 
+	/* 如果连设备都没有，直接安全退出，不需要 put */
 	if (!dev) {
 		return;
 	}
 
 	if (!dev->ff) {
-		goto out_put; /* 安全退出通道 */
+		goto out_put; 
 	}
 
 	if (gamepad_effect_id == -1) {
@@ -89,6 +89,7 @@ static void gamepad_rumble_worker(struct work_struct *work)
 		if (ret == 0) {
 			gamepad_effect_id = effect.id;
 		} else {
+			/* 【核心修复：绝对不能在这里直接 return，必须走 out_put！】 */
 			goto out_put; 
 		}
 	}
@@ -108,7 +109,7 @@ static void gamepad_rumble_worker(struct work_struct *work)
 	}
 
 out_put:
-	/* 任务结束，释放设备引用 */
+	/* 【最后收尾】：绝对守恒！走到这必放行引用，绝不留僵尸设备给休眠机制 */
 	input_put_device(dev);
 }
 static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
