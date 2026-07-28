@@ -22,7 +22,7 @@
 struct input_dev *active_gamepad = NULL;
 static int gamepad_effect_id = 0; /* 霸占 0 号特效槽位 */
 DEFINE_SPINLOCK(active_gamepad_lock); /* 生死锁：仅用于极速保护指针读写 */
-
+int trigger_gamepad_vib_from_system(int intensity);
 /* ---- 强制刹车延时任务（严守 50ms 协议） ---- */
 static void gamepad_stop_worker(struct work_struct *work)
 {
@@ -306,7 +306,7 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		   unsigned int code, int value)
 {
 	struct ff_device *ff = dev->ff;
-
+    unsigned long flags;
 	if (type != EV_FF)
 		return 0;
 
