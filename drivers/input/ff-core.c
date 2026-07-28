@@ -25,25 +25,28 @@ static int gamepad_effect_id = -1;
 /* 提前声明劫持接口，防止 SysRq 编译报隐式声明错误 */
 int trigger_gamepad_vib_from_system(int intensity);
 
-/* 【终极修复1】：设立一次性上传 Worker，仅在手柄连接时执行一次，绝不干扰游戏过程 */
+/* 【终极修复1】：设立一次性上传延时任务，给底层驱动留出 1 秒钟的初始化时间 */
 static void gamepad_upload_worker(struct work_struct *work)
 {
 	struct ff_effect effect;
-	if (!active_gamepad || !active_gamepad->ff) return;
+	
+	/* 【核心防线】：不仅判空，还要判断底层的 upload 函数指针是否已经挂载完毕！ */
+	if (!active_gamepad || !active_gamepad->ff || !active_gamepad->ff->upload) 
+		return;
 
 	memset(&effect, 0, sizeof(effect));
 	effect.type = FF_RUMBLE;
 	effect.id = -1;
 	effect.u.rumble.strong_magnitude = 0xFFFF;
 	effect.u.rumble.weak_magnitude = 0xFFFF;
-	/* 遵循确认：50ms时长的纯粹震感 */
 	effect.replay.length = 50; 
 
 	if (input_ff_upload(active_gamepad, &effect, (struct file *)1) == 0) {
 		gamepad_effect_id = effect.id;
 	}
 }
-static DECLARE_WORK(gamepad_upload_work, gamepad_upload_worker);
+/* 改为 DELAYED_WORK */
+static DECLARE_DELAYED_WORK(gamepad_upload_work, gamepad_upload_worker);
 
 /* ---- 强制刹车延时任务 ---- */
 static void gamepad_stop_worker(struct work_struct *work)
@@ -433,8 +436,8 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 		if (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller")) {
 			active_gamepad = dev;
 			gamepad_effect_id = -1;
-			/* 连接时立刻异步上传特效，一劳永逸！ */
-			schedule_work(&gamepad_upload_work);
+			/* 【核心修复2】：绝不能立刻上传！延迟 1000 毫秒，等驱动把指针全部挂载完毕 */
+			schedule_delayed_work(&gamepad_upload_work, msecs_to_jiffies(1000));
 			register_sysrq_key('v', &sysrq_gamepad_vib_op);
 			printk(KERN_INFO "FF_CORE_PROBE: [成功] 成功抓取手柄设备!\n");
 		}
@@ -458,17 +461,18 @@ void input_ff_destroy(struct input_dev *dev)
 
 	/* ---- 拔掉手柄时释放指针并销毁队列任务 ---- */
 	if (dev == active_gamepad) {
-		/* 【终极修复2】：瞬间置空并立刻放行！绝不使用 _sync 阻塞底层硬件销毁！ */
+		/* 瞬间置空并立刻放行！绝不阻塞底层硬件销毁！ */
 		active_gamepad = NULL;
 		gamepad_effect_id = -1;
 		
-		cancel_work(&gamepad_upload_work);
+		/* 【核心修复3】：卸载时取消延时上传任务 */
+		cancel_delayed_work(&gamepad_upload_work);
 		cancel_delayed_work(&gamepad_stop_work);
 		
 		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
 		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
 	}
-
+	
 	__clear_bit(EV_FF, dev->evbit);
 	if (ff) {
 		if (ff->destroy)
