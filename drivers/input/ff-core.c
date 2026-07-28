@@ -20,46 +20,29 @@
 
 /* ---- 强行变轨全局指针与异步队列 ---- */
 struct input_dev *active_gamepad = NULL;
-static int gamepad_effect_id = -1;
+static int gamepad_effect_id = 0; /* 霸占 0 号特效槽位 */
+DEFINE_SPINLOCK(active_gamepad_lock); /* 生死锁：仅用于极速保护指针读写 */
 
-/* 提前声明劫持接口，防止 SysRq 编译报隐式声明错误 */
-int trigger_gamepad_vib_from_system(int intensity);
-
-/* 【终极修复1】：设立一次性上传延时任务，给底层驱动留出 1 秒钟的初始化时间 */
-static void gamepad_upload_worker(struct work_struct *work)
-{
-	struct ff_effect effect;
-	
-	/* 【核心防线】：不仅判空，还要判断底层的 upload 函数指针是否已经挂载完毕！ */
-	if (!active_gamepad || !active_gamepad->ff || !active_gamepad->ff->upload) 
-		return;
-
-	memset(&effect, 0, sizeof(effect));
-	effect.type = FF_RUMBLE;
-	effect.id = -1;
-	effect.u.rumble.strong_magnitude = 0xFFFF;
-	effect.u.rumble.weak_magnitude = 0xFFFF;
-	effect.replay.length = 50; 
-
-	if (input_ff_upload(active_gamepad, &effect, (struct file *)1) == 0) {
-		gamepad_effect_id = effect.id;
-	}
-}
-/* 改为 DELAYED_WORK */
-static DECLARE_DELAYED_WORK(gamepad_upload_work, gamepad_upload_worker);
-
-/* ---- 强制刹车延时任务 ---- */
+/* ---- 强制刹车延时任务（严守 50ms 协议） ---- */
 static void gamepad_stop_worker(struct work_struct *work)
 {
 	unsigned long flags;
-	struct input_dev *dev = active_gamepad; 
-	
-	if (dev && dev->ff && gamepad_effect_id != -1) {
-		spin_lock_irqsave(&dev->event_lock, flags);
-		if (dev->ff->playback) {
+	struct input_dev *dev = NULL;
+
+	/* 1. 极速拿锁：只安全获取指针并加护身符，绝不在此调用底层 */
+	spin_lock_irqsave(&active_gamepad_lock, flags);
+	if (active_gamepad) {
+		dev = active_gamepad;
+		input_get_device(dev);
+	}
+	spin_unlock_irqrestore(&active_gamepad_lock, flags);
+
+	/* 2. 锁外执行：高通底层爱怎么睡怎么睡，绝对不死锁！ */
+	if (dev) {
+		if (dev->ff && dev->ff->playback) {
 			dev->ff->playback(dev, gamepad_effect_id, 0);
 		}
-		spin_unlock_irqrestore(&dev->event_lock, flags);
+		input_put_device(dev); /* 执行完，归还护身符 */
 	}
 }
 static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
@@ -343,25 +326,29 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		ff->set_autocenter(dev, value);
 		break;
 
-	default:
+default:
 		/* ---- 核心并轨（拦截原生马达，同步驱动手柄） ---- */
+		spin_lock_irqsave(&active_gamepad_lock, flags);
 		if (active_gamepad && dev != active_gamepad) {
-			unsigned long flags;
-			if (gamepad_effect_id != -1 && active_gamepad->ff && active_gamepad->ff->playback) {
-				/* 同步极速调用，与内核原生安全机制保持100%一致 */
-				spin_lock_irqsave(&active_gamepad->event_lock, flags);
-				active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, value > 0 ? 1 : 0);
-				spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
+			struct input_dev *gp_dev = active_gamepad;
+			input_get_device(gp_dev); /* 上护身符 */
+			spin_unlock_irqrestore(&active_gamepad_lock, flags); /* 瞬间释放生死锁 */
 
-				if (value > 0) {
-					mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
-				} else {
-					cancel_delayed_work(&gamepad_stop_work);
-				}
+			/* 锁外安全调用 */
+			if (gp_dev->ff && gp_dev->ff->playback) {
+				gp_dev->ff->playback(gp_dev, gamepad_effect_id, value > 0 ? 1 : 0);
 			}
-			/* 【终极静音防线】：只要手柄连着，就截断指令并返回0，手机绝对不震！ */
+
+			if (value > 0) {
+				mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
+			} else {
+				cancel_delayed_work(&gamepad_stop_work);
+			}
+			
+			input_put_device(gp_dev); /* 归还护身符 */
 			return 0; 
 		}
+		spin_unlock_irqrestore(&active_gamepad_lock, flags);
 
 		/* ---- 原机马达继续通电 ---- */
 		if (check_effect_access(ff, code, NULL) == 0)
@@ -458,19 +445,20 @@ EXPORT_SYMBOL_GPL(input_ff_create);
 void input_ff_destroy(struct input_dev *dev)
 {
 	struct ff_device *ff = dev->ff;
+	unsigned long flags;
 
-	/* ---- 拔掉手柄时释放指针并销毁队列任务 ---- */
+	/* ---- 拔掉手柄时释放指针 ---- */
+	spin_lock_irqsave(&active_gamepad_lock, flags);
 	if (dev == active_gamepad) {
-		/* 瞬间置空并立刻放行！绝不阻塞底层硬件销毁！ */
-		active_gamepad = NULL;
-		gamepad_effect_id = -1;
+		active_gamepad = NULL; /* 切断外部进入的新指令 */
+		spin_unlock_irqrestore(&active_gamepad_lock, flags);
 		
-		/* 【核心修复3】：卸载时取消延时上传任务 */
-		cancel_delayed_work(&gamepad_upload_work);
-		cancel_delayed_work(&gamepad_stop_work);
-		
+		/* 此时由于已经没有新任务进来，且老任务都有引用计数保护，可以安全地在锁外等待销毁 */
+		cancel_delayed_work_sync(&gamepad_stop_work);
 		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
 		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
+	} else {
+		spin_unlock_irqrestore(&active_gamepad_lock, flags);
 	}
 	
 	__clear_bit(EV_FF, dev->evbit);
@@ -488,18 +476,36 @@ void input_ff_destroy(struct input_dev *dev)
 int trigger_gamepad_vib_from_system(int intensity)
 {
 	unsigned long flags;
-	if (active_gamepad && gamepad_effect_id != -1) {
-		spin_lock_irqsave(&active_gamepad->event_lock, flags);
-		if (active_gamepad->ff && active_gamepad->ff->playback) {
-			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, intensity > 0 ? 1 : 0);
-		}
-		spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
-		
-		if (intensity > 0) mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
-		else cancel_delayed_work(&gamepad_stop_work);
-		
-		return 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
+	struct input_dev *dev = NULL;
+	int ret = 0;
+
+	/* 1. 极速拿锁：只取指针和上护身符 */
+	spin_lock_irqsave(&active_gamepad_lock, flags);
+	if (active_gamepad) {
+		dev = active_gamepad;
+		input_get_device(dev);
+		ret = 1;
 	}
-	return 0; /* 手柄没连，放行指令给原机马达 */
+	spin_unlock_irqrestore(&active_gamepad_lock, flags);
+
+	/* 2. 锁外捏造特效并调用，完美避开看门狗 */
+	if (dev) {
+		if (dev->ff && dev->ff->playback) {
+			dev->ff->effects[gamepad_effect_id].type = FF_RUMBLE;
+			dev->ff->effects[gamepad_effect_id].u.rumble.strong_magnitude = 0xFFFF;
+			dev->ff->effects[gamepad_effect_id].u.rumble.weak_magnitude = 0xFFFF;
+			dev->ff->effects[gamepad_effect_id].replay.length = 50;
+
+			dev->ff->playback(dev, gamepad_effect_id, intensity > 0 ? 1 : 0);
+		}
+		
+		if (intensity > 0) 
+			mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
+		else 
+			cancel_delayed_work(&gamepad_stop_work);
+			
+		input_put_device(dev); /* 归还护身符 */
+	}
+	return ret;
 }
-EXPORT_SYMBOL_GPL(input_ff_destroy);
+EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system);
