@@ -22,6 +22,9 @@
 struct input_dev *active_gamepad = NULL;
 static int gamepad_effect_id = -1;
 
+/* 提前声明劫持接口，防止 SysRq 编译报隐式声明错误 */
+int trigger_gamepad_vib_from_system(int intensity);
+
 /* 【终极修复1】：设立一次性上传 Worker，仅在手柄连接时执行一次，绝不干扰游戏过程 */
 static void gamepad_upload_worker(struct work_struct *work)
 {
@@ -58,68 +61,6 @@ static void gamepad_stop_worker(struct work_struct *work)
 }
 static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
 /* -------------------------------- */
-
-static void gamepad_rumble_worker(struct work_struct *work)
-{
-	struct ff_effect effect;
-	int val = gamepad_rumble_value;
-	int ret;
-	unsigned long flags; 
-	struct input_dev *dev;
-
-	mutex_lock(&gamepad_mutex);
-	dev = active_gamepad;
-	if (dev) {
-		input_get_device(dev); /* 拿到引用 */
-	}
-	mutex_unlock(&gamepad_mutex);
-
-	/* 如果连设备都没有，直接安全退出，不需要 put */
-	if (!dev) {
-		return;
-	}
-
-	if (!dev->ff) {
-		goto out_put; 
-	}
-
-	if (gamepad_effect_id == -1) {
-		memset(&effect, 0, sizeof(effect));
-		effect.type = FF_RUMBLE;
-		effect.id = -1;
-		effect.u.rumble.strong_magnitude = 0xFFFF;
-		effect.u.rumble.weak_magnitude = 0xFFFF;
-		effect.replay.length = 50; 
-
-		ret = input_ff_upload(dev, &effect, (struct file *)1);
-		if (ret == 0) {
-			gamepad_effect_id = effect.id;
-		} else {
-			/* 【核心修复：绝对不能在这里直接 return，必须走 out_put！】 */
-			goto out_put; 
-		}
-	}
-
-	if (gamepad_effect_id != -1) {
-		spin_lock_irqsave(&dev->event_lock, flags);
-		if (dev->ff && dev->ff->playback) {
-			dev->ff->playback(dev, gamepad_effect_id, (val > 0) ? 1 : 0);
-		}
-		spin_unlock_irqrestore(&dev->event_lock, flags);
-
-		if (val > 0) {
-			mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
-		} else {
-			cancel_delayed_work(&gamepad_stop_work);
-		}
-	}
-
-out_put:
-	/* 【最后收尾】：绝对守恒！走到这必放行引用，绝不留僵尸设备给休眠机制 */
-	input_put_device(dev);
-}
-static DECLARE_WORK(gamepad_rumble_work, gamepad_rumble_worker);
-
 
 /* ---- 专属内核调试指令 (SysRq) ---- */
 static void sysrq_handle_gamepad_vib(u8 key)
