@@ -22,7 +22,7 @@
 struct input_dev *active_gamepad = NULL;
 static int gamepad_effect_id = -1;
 
-/* 提前声明劫持接口，防止 SysRq 编译报隐式声明错误 */
+/* 提前声明，防止警告 */
 int trigger_gamepad_vib_from_system(int intensity);
 
 /* 【终极修复1】：设立一次性上传延时任务，给底层驱动留出 1 秒钟的初始化时间 */
@@ -118,10 +118,6 @@ static int compat_effect(struct ff_device *ff, struct ff_effect *effect)
 		if (!test_bit(FF_PERIODIC, ff->ffbit))
 			return -EINVAL;
 
-		/*
-		 * calculate magnitude of sine wave as average of rumble's
-		 * 2/3 of strong magnitude and 1/3 of weak magnitude
-		 */
 		magnitude = effect->u.rumble.strong_magnitude / 3 +
 			    effect->u.rumble.weak_magnitude / 6;
 
@@ -139,17 +135,10 @@ static int compat_effect(struct ff_device *ff, struct ff_effect *effect)
 		return 0;
 
 	default:
-		/* Let driver handle conversion */
 		return 0;
 	}
 }
 
-/**
- * input_ff_upload() - upload effect into force-feedback device
- * @dev: input device
- * @effect: effect to be uploaded
- * @file: owner of the effect
- */
 int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 		    struct file *file)
 {
@@ -226,10 +215,6 @@ int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 }
 EXPORT_SYMBOL_GPL(input_ff_upload);
 
-/*
- * Erases the effect if the requester is also the effect owner. The mutex
- * should already be locked before calling this function.
- */
 static int erase_effect(struct input_dev *dev, int effect_id,
 			struct file *file)
 {
@@ -259,16 +244,6 @@ static int erase_effect(struct input_dev *dev, int effect_id,
 	return 0;
 }
 
-/**
- * input_ff_erase - erase a force-feedback effect from device
- * @dev: input device to erase effect from
- * @effect_id: id of the effect to be erased
- * @file: purported owner of the request
- *
- * This function erases a force-feedback effect from specified device.
- * The effect will only be erased if it was uploaded through the same
- * file handle that is requesting erase.
- */
 int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file)
 {
 	struct ff_device *ff = dev->ff;
@@ -285,15 +260,6 @@ int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file)
 }
 EXPORT_SYMBOL_GPL(input_ff_erase);
 
-/*
- * input_ff_flush - erase all effects owned by a file handle
- * @dev: input device to erase effect from
- * @file: purported owner of the effects
- *
- * This function erases all force-feedback effects associated with
- * the given owner from specified device. Note that @file may be %NULL,
- * in which case all effects will be erased.
- */
 int input_ff_flush(struct input_dev *dev, struct file *file)
 {
 	struct ff_device *ff = dev->ff;
@@ -312,13 +278,6 @@ int input_ff_flush(struct input_dev *dev, struct file *file)
 }
 EXPORT_SYMBOL_GPL(input_ff_flush);
 
-/**
- * input_ff_event() - generic handler for force-feedback events
- * @dev: input device to send the effect to
- * @type: event type (anything but EV_FF is ignored)
- * @code: event code
- * @value: event value
- */
 int input_ff_event(struct input_dev *dev, unsigned int type,
 		   unsigned int code, int value)
 {
@@ -334,13 +293,13 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		}
 		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
-		ff->set_gain(dev, value);
+		if (ff->set_gain) ff->set_gain(dev, value);
 		break;
 
 	case FF_AUTOCENTER:
 		if (!test_bit(FF_AUTOCENTER, dev->ffbit) || value > 0xffffU)
 			break;
-		ff->set_autocenter(dev, value);
+		if (ff->set_autocenter) ff->set_autocenter(dev, value);
 		break;
 
 	default:
@@ -348,7 +307,6 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		if (active_gamepad && dev != active_gamepad) {
 			unsigned long flags;
 			if (gamepad_effect_id != -1 && active_gamepad->ff && active_gamepad->ff->playback) {
-				/* 同步极速调用，与内核原生安全机制保持100%一致 */
 				spin_lock_irqsave(&active_gamepad->event_lock, flags);
 				active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, value > 0 ? 1 : 0);
 				spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
@@ -359,7 +317,6 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 					cancel_delayed_work(&gamepad_stop_work);
 				}
 			}
-			/* 【终极静音防线】：只要手柄连着，就截断指令并返回0，手机绝对不震！ */
 			return 0; 
 		}
 
@@ -373,17 +330,6 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 }
 EXPORT_SYMBOL_GPL(input_ff_event);
 
-/**
- * input_ff_create() - create force-feedback device
- * @dev: input device supporting force-feedback
- * @max_effects: maximum number of effects supported by the device
- *
- * This function allocates all necessary memory for a force feedback
- * portion of an input device and installs all default handlers.
- * @dev->ffbit should be already set up before calling this function.
- * Once ff device is created you need to setup its upload, erase,
- * playback and other handlers before registering input device
- */
 int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 {
 	struct ff_device *ff;
@@ -447,14 +393,6 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 }
 EXPORT_SYMBOL_GPL(input_ff_create);
 
-/**
- * input_ff_destroy() - frees force feedback portion of input device
- * @dev: input device supporting force feedback
- *
- * This function is only needed in error path as input core will
- * automatically free force feedback structures when device is
- * destroyed.
- */
 void input_ff_destroy(struct input_dev *dev)
 {
 	struct ff_device *ff = dev->ff;
@@ -472,7 +410,7 @@ void input_ff_destroy(struct input_dev *dev)
 		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
 		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
 	}
-	
+
 	__clear_bit(EV_FF, dev->evbit);
 	if (ff) {
 		if (ff->destroy)
@@ -498,8 +436,8 @@ int trigger_gamepad_vib_from_system(int intensity)
 		if (intensity > 0) mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
 		else cancel_delayed_work(&gamepad_stop_work);
 		
-		return 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
+		return 1; 
 	}
-	return 0; /* 手柄没连，放行指令给原机马达 */
+	return 0; 
 }
-EXPORT_SYMBOL_GPL(input_ff_destroy);
+EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system);
