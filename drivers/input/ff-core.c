@@ -36,14 +36,20 @@ int trigger_gamepad_vib_from_system(int intensity);
 static void gamepad_upload_worker(struct work_struct *work)
 {
 	struct ff_effect effect;
-	struct input_dev *dev;
+	unsigned long flags;
 	
-	atomic_inc(&gamepad_ff_usage);
-	dev = READ_ONCE(active_gamepad);
+	/* 非阻塞尝试拿锁 */
+	if (!spin_trylock_irqsave(&gamepad_hijack_lock, flags))
+		return;
+		
+	/* 【僵尸探测】：如果设备被拔出但被应用占用导致未销毁，立刻置空 */
+	if (active_gamepad && !input_get_drvdata(active_gamepad)) {
+		active_gamepad = NULL;
+		gamepad_effect_id = -1;
+	}
 	
-	if (!dev || !dev->ff || !dev->ff->upload) {
-		pr_err("FF_CORE_DBG: [手柄初始化] 失败, 指针为空或未挂载\n");
-		atomic_dec(&gamepad_ff_usage);
+	if (!active_gamepad || !active_gamepad->ff || !active_gamepad->ff->upload) {
+		spin_unlock_irqrestore(&gamepad_hijack_lock, flags);
 		return;
 	}
 
@@ -54,11 +60,10 @@ static void gamepad_upload_worker(struct work_struct *work)
 	effect.u.rumble.weak_magnitude = 0xFFFF;
 	effect.replay.length = 50; 
 
-	if (input_ff_upload(dev, &effect, (struct file *)1) == 0) {
+	if (input_ff_upload(active_gamepad, &effect, (struct file *)1) == 0) {
 		gamepad_effect_id = effect.id;
-		pr_err("FF_CORE_DBG: [手柄初始化] 成功, ID=%d\n", effect.id);
 	}
-	atomic_dec(&gamepad_ff_usage);
+	spin_unlock_irqrestore(&gamepad_hijack_lock, flags);
 }
 static DECLARE_DELAYED_WORK(gamepad_upload_work, gamepad_upload_worker);
 
@@ -71,12 +76,18 @@ static void gamepad_stop_worker(struct work_struct *work)
 	if (!spin_trylock_irqsave(&gamepad_hijack_lock, h_flags))
 		return;
 		
-	if (active_gamepad && gamepad_effect_id != -1 && active_gamepad->ff) {
-		spin_lock_irqsave(&active_gamepad->event_lock, flags);
-		if (active_gamepad->ff->playback) {
-			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, 0);
+	if (active_gamepad) {
+		/* 【僵尸探测】 */
+		if (!input_get_drvdata(active_gamepad)) {
+			active_gamepad = NULL;
+			gamepad_effect_id = -1;
+		} else if (gamepad_effect_id != -1 && active_gamepad->ff) {
+			spin_lock_irqsave(&active_gamepad->event_lock, flags);
+			if (active_gamepad->ff->playback) {
+				active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, 0);
+			}
+			spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
 		}
-		spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
 	}
 	spin_unlock_irqrestore(&gamepad_hijack_lock, h_flags);
 }
@@ -322,27 +333,38 @@ default:
 		/* ---- 核心并轨（拦截原生马达，同步驱动手柄） ---- */
 		if (active_gamepad && dev != active_gamepad) {
 			unsigned long h_flags;
+			int hijacked = 0;
 			
 			/* 非阻塞极速拿锁，完美规避死锁和看门狗 */
 			if (spin_trylock_irqsave(&gamepad_hijack_lock, h_flags)) {
-				if (active_gamepad && gamepad_effect_id != -1 && active_gamepad->ff && active_gamepad->ff->playback) {
-					unsigned long flags;
-					spin_lock_irqsave(&active_gamepad->event_lock, flags);
-					if (active_gamepad->ff && active_gamepad->ff->playback) {
-						active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, value > 0 ? 1 : 0);
-					}
-					spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
-
-					if (value > 0) {
-						mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
+				if (active_gamepad) {
+					/* 【神级防线】：识别被应用强行占用的僵尸节点。一旦底层返回 NULL，
+					 * 立刻原地斩杀释放，绝不往下传给 playback 引发 0x40 崩溃！ */
+					if (!input_get_drvdata(active_gamepad)) {
+						active_gamepad = NULL;
+						gamepad_effect_id = -1;
 					} else {
-						cancel_delayed_work(&gamepad_stop_work);
+						if (gamepad_effect_id != -1 && active_gamepad->ff && active_gamepad->ff->playback) {
+							unsigned long flags;
+							spin_lock_irqsave(&active_gamepad->event_lock, flags);
+							if (active_gamepad->ff && active_gamepad->ff->playback) {
+								active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, value > 0 ? 1 : 0);
+							}
+							spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
+
+							if (value > 0) {
+								mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
+							} else {
+								cancel_delayed_work(&gamepad_stop_work);
+							}
+						}
+						hijacked = 1; /* 只要手柄真正存活，就标记拦截 */
 					}
 				}
 				spin_unlock_irqrestore(&gamepad_hijack_lock, h_flags);
 			}
 			/* 【终极静音防线】：截断指令并返回0，手机绝对不震！ */
-			return 0; 
+			if (hijacked) return 0; 
 		}
 
 		/* ---- 原机马达继续通电 ---- */
@@ -473,17 +495,23 @@ int trigger_gamepad_vib_from_system(int intensity)
 	if (!spin_trylock_irqsave(&gamepad_hijack_lock, h_flags))
 		return 0;
 		
-	if (active_gamepad && gamepad_effect_id != -1) {
-		spin_lock_irqsave(&active_gamepad->event_lock, flags);
-		if (active_gamepad->ff && active_gamepad->ff->playback) {
-			active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, intensity > 0 ? 1 : 0);
+	if (active_gamepad) {
+		/* 【僵尸探测】 */
+		if (!input_get_drvdata(active_gamepad)) {
+			active_gamepad = NULL;
+			gamepad_effect_id = -1;
+		} else if (gamepad_effect_id != -1) {
+			spin_lock_irqsave(&active_gamepad->event_lock, flags);
+			if (active_gamepad->ff && active_gamepad->ff->playback) {
+				active_gamepad->ff->playback(active_gamepad, gamepad_effect_id, intensity > 0 ? 1 : 0);
+			}
+			spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
+			
+			if (intensity > 0) mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
+			else cancel_delayed_work(&gamepad_stop_work);
+			
+			ret = 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
 		}
-		spin_unlock_irqrestore(&active_gamepad->event_lock, flags);
-		
-		if (intensity > 0) mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
-		else cancel_delayed_work(&gamepad_stop_work);
-		
-		ret = 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
 	}
 	
 	spin_unlock_irqrestore(&gamepad_hijack_lock, h_flags);
