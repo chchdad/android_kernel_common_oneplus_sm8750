@@ -80,8 +80,6 @@ static void gamepad_stop_worker(struct work_struct *work)
 	}
 	spin_unlock_irqrestore(&gamepad_hijack_lock, h_flags);
 }
-	atomic_dec(&gamepad_ff_usage);
-}
 static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
 /* -------------------------------- */
 
@@ -352,16 +350,7 @@ default:
 			ff->playback(dev, code, value);
 		break;
 		}
-
-		if (check_effect_access(ff, code, NULL) == 0) {
-			if (ff->playback) {
-				ff->playback(dev, code, value);
-				pr_err("FF_CORE_DBG: [原生放行] 马达正常震动\n");
-			}
-		}
-		break;
-	}
-
+	
 	atomic_dec(&gamepad_ff_usage);
 	return 0;
 }
