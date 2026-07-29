@@ -406,12 +406,23 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 	/* ---- 抓取手柄设备探针 ---- */
 	if (dev->name) {
 		if (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller")) {
-			WRITE_ONCE(active_gamepad, dev);
-			gamepad_effect_id = -1;
-			/* 延迟 1000 毫秒，等驱动把指针全部挂载完毕 */
-			schedule_delayed_work(&gamepad_upload_work, msecs_to_jiffies(1000));
-			register_sysrq_key('v', &sysrq_gamepad_vib_op);
-			pr_err("FF_CORE_DBG: [探针] 抓取手柄成功! name=%s\n", dev->name);
+			unsigned long flags;
+			spin_lock_irqsave(&gamepad_hijack_lock, flags);
+			
+			/* 【终极防线】：严防多节点重复注册导致内核链表断裂卡死 */
+			if (!active_gamepad) {
+				active_gamepad = dev;
+				gamepad_effect_id = -1;
+				spin_unlock_irqrestore(&gamepad_hijack_lock, flags);
+				
+				/* 延迟 1000 毫秒，等驱动把指针全部挂载完毕 */
+				schedule_delayed_work(&gamepad_upload_work, msecs_to_jiffies(1000));
+				register_sysrq_key('v', &sysrq_gamepad_vib_op);
+				printk(KERN_INFO "FF_CORE_PROBE: [成功] 成功抓取手柄设备!\n");
+			} else {
+				/* 已有节点，放过后续的影子节点 */
+				spin_unlock_irqrestore(&gamepad_hijack_lock, flags);
+			}
 		}
 	}
 
