@@ -29,18 +29,17 @@ atomic_t gamepad_ff_usage = ATOMIC_INIT(0);
 /* 提前声明劫持接口，防止 SysRq 编译报隐式声明错误 */
 int trigger_gamepad_vib_from_system(int intensity);
 
-/* 【终极修复1】：设立一次性上传延时任务，给底层驱动留出 1 秒钟的初始化时间 */
+/* 【终极修复1】：设立一次性上传延时任务 */
 static void gamepad_upload_worker(struct work_struct *work)
 {
 	struct ff_effect effect;
-	/* 安全缓存指针，防止中途变 NULL */
 	struct input_dev *dev;
 	
 	atomic_inc(&gamepad_ff_usage);
 	dev = READ_ONCE(active_gamepad);
 	
-	/* 【核心防线】：不仅判空，还要判断底层的 upload 函数指针是否已经挂载完毕！ */
 	if (!dev || !dev->ff || !dev->ff->upload) {
+		printk(KERN_INFO "FF_CORE_DBG: [手柄初始化] 失败 - 指针为空或 upload 未就绪\n");
 		atomic_dec(&gamepad_ff_usage);
 		return;
 	}
@@ -54,10 +53,12 @@ static void gamepad_upload_worker(struct work_struct *work)
 
 	if (input_ff_upload(dev, &effect, (struct file *)1) == 0) {
 		gamepad_effect_id = effect.id;
+		printk(KERN_INFO "FF_CORE_DBG: [手柄初始化] 特效上传成功, ID=%d\n", gamepad_effect_id);
+	} else {
+		printk(KERN_INFO "FF_CORE_DBG: [手柄初始化] 特效上传失败\n");
 	}
 	atomic_dec(&gamepad_ff_usage);
 }
-/* 改为 DELAYED_WORK */
 static DECLARE_DELAYED_WORK(gamepad_upload_work, gamepad_upload_worker);
 
 /* ---- 强制刹车延时任务 ---- */
@@ -84,7 +85,7 @@ static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
 /* ---- 专属内核调试指令 (SysRq) ---- */
 static void sysrq_handle_gamepad_vib(u8 key)
 {
-	printk(KERN_INFO "FF_CORE_PROBE: 收到 SysRq 调试指令，强制触发手柄震动!\n");
+	printk(KERN_INFO "FF_CORE_DBG: 收到 SysRq 调试指令，强制触发手柄震动!\n");
 	trigger_gamepad_vib_from_system(1);
 }
 static const struct sysrq_key_op sysrq_gamepad_vib_op = {
@@ -94,10 +95,6 @@ static const struct sysrq_key_op sysrq_gamepad_vib_op = {
 	.enable_mask = SYSRQ_ENABLE_DUMP,
 };
 
-/*
- * Check that the effect_id is a valid effect and whether the user
- * is the owner
- */
 static int check_effect_access(struct ff_device *ff, int effect_id,
 				struct file *file)
 {
@@ -111,9 +108,6 @@ static int check_effect_access(struct ff_device *ff, int effect_id,
 	return 0;
 }
 
-/*
- * Checks whether 2 effects can be combined together
- */
 static inline int check_effects_compatible(struct ff_effect *e1,
 					   struct ff_effect *e2)
 {
@@ -122,9 +116,6 @@ static inline int check_effects_compatible(struct ff_effect *e1,
 		e1->u.periodic.waveform == e2->u.periodic.waveform);
 }
 
-/*
- * Convert an effect into compatible one
- */
 static int compat_effect(struct ff_device *ff, struct ff_effect *effect)
 {
 	int magnitude;
@@ -134,10 +125,6 @@ static int compat_effect(struct ff_device *ff, struct ff_effect *effect)
 		if (!test_bit(FF_PERIODIC, ff->ffbit))
 			return -EINVAL;
 
-		/*
-		 * calculate magnitude of sine wave as average of rumble's
-		 * 2/3 of strong magnitude and 1/3 of weak magnitude
-		 */
 		magnitude = effect->u.rumble.strong_magnitude / 3 +
 			    effect->u.rumble.weak_magnitude / 6;
 
@@ -155,17 +142,10 @@ static int compat_effect(struct ff_device *ff, struct ff_effect *effect)
 		return 0;
 
 	default:
-		/* Let driver handle conversion */
 		return 0;
 	}
 }
 
-/**
- * input_ff_upload() - upload effect into force-feedback device
- * @dev: input device
- * @effect: effect to be uploaded
- * @file: owner of the effect
- */
 int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 		    struct file *file)
 {
@@ -242,10 +222,6 @@ int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 }
 EXPORT_SYMBOL_GPL(input_ff_upload);
 
-/*
- * Erases the effect if the requester is also the effect owner. The mutex
- * should already be locked before calling this function.
- */
 static int erase_effect(struct input_dev *dev, int effect_id,
 			struct file *file)
 {
@@ -275,16 +251,6 @@ static int erase_effect(struct input_dev *dev, int effect_id,
 	return 0;
 }
 
-/**
- * input_ff_erase - erase a force-feedback effect from device
- * @dev: input device to erase effect from
- * @effect_id: id of the effect to be erased
- * @file: purported owner of the request
- *
- * This function erases a force-feedback effect from specified device.
- * The effect will only be erased if it was uploaded through the same
- * file handle that is requesting erase.
- */
 int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file)
 {
 	struct ff_device *ff = dev->ff;
@@ -301,15 +267,6 @@ int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file)
 }
 EXPORT_SYMBOL_GPL(input_ff_erase);
 
-/*
- * input_ff_flush - erase all effects owned by a file handle
- * @dev: input device to erase effect from
- * @file: purported owner of the effects
- *
- * This function erases all force-feedback effects associated with
- * the given owner from specified device. Note that @file may be %NULL,
- * in which case all effects will be erased.
- */
 int input_ff_flush(struct input_dev *dev, struct file *file)
 {
 	struct ff_device *ff = dev->ff;
@@ -328,18 +285,10 @@ int input_ff_flush(struct input_dev *dev, struct file *file)
 }
 EXPORT_SYMBOL_GPL(input_ff_flush);
 
-/**
- * input_ff_event() - generic handler for force-feedback events
- * @dev: input device to send the effect to
- * @type: event type (anything but EV_FF is ignored)
- * @code: event code
- * @value: event value
- */
 int input_ff_event(struct input_dev *dev, unsigned int type,
 		   unsigned int code, int value)
 {
 	struct ff_device *ff = dev->ff;
-	/* 快照缓存指针，防止代码执行中途手柄拔出变 NULL 导致 0x40 越界崩溃 */
 	struct input_dev *gp;
 
 	if (type != EV_FF)
@@ -348,34 +297,41 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 	atomic_inc(&gamepad_ff_usage);
 	gp = READ_ONCE(active_gamepad);
 
+	printk(KERN_INFO "FF_CORE_DBG: [收到事件] dev_name=%s, code=%u, value=%d\n",
+	       dev->name ? dev->name : "unknown", code, value);
+
 	switch (code) {
 	case FF_GAIN:
-		/* 100% 还原 [source: 6] 的原生马达增益逻辑，绝不漏写代码！ */
 		if (gp && dev != gp && gp->ff && gp->ff->set_gain) {
 			gp->ff->set_gain(gp, value);
 		}
-		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
+		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU) {
+			printk(KERN_INFO "FF_CORE_DBG: [FF_GAIN] 原生拦截 (test_bit 失败)\n");
 			break;
-		ff->set_gain(dev, value);
+		}
+		if (ff && ff->set_gain) {
+			ff->set_gain(dev, value);
+			printk(KERN_INFO "FF_CORE_DBG: [FF_GAIN] 原生放行\n");
+		}
 		break;
 
 	case FF_AUTOCENTER:
-		/* 100% 还原 [source: 6] 的原生居中逻辑 */
 		if (!test_bit(FF_AUTOCENTER, dev->ffbit) || value > 0xffffU)
 			break;
-		ff->set_autocenter(dev, value);
+		if (ff && ff->set_autocenter) ff->set_autocenter(dev, value);
 		break;
 
 	default:
 		/* ---- 核心并轨（拦截原生马达，同步驱动手柄） ---- */
 		if (gp && dev != gp) {
 			unsigned long flags;
+			printk(KERN_INFO "FF_CORE_DBG: [劫持逻辑] 发现已连接的手柄，准备拦截\n");
+			
 			if (gamepad_effect_id != -1 && gp->ff && gp->ff->playback) {
-				/* 同步极速调用，与内核原生安全机制保持100%一致 */
 				spin_lock_irqsave(&gp->event_lock, flags);
-				/* 再次确认指针未飞，规避 0x40 UAF 死穴 */
 				if (gp->ff && gp->ff->playback) {
 					gp->ff->playback(gp, gamepad_effect_id, value > 0 ? 1 : 0);
+					printk(KERN_INFO "FF_CORE_DBG: [劫持成功] 震动指令已下发至手柄\n");
 				}
 				spin_unlock_irqrestore(&gp->event_lock, flags);
 
@@ -384,16 +340,30 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 				} else {
 					cancel_delayed_work(&gamepad_stop_work);
 				}
+			} else {
+				printk(KERN_INFO "FF_CORE_DBG: [劫持失败] 手柄指针异常或 ID 为 -1\n");
 			}
-			/* 【终极静音防线】：只要手柄连着，就截断指令并返回0，手机绝对不震！ */
+			
 			atomic_dec(&gamepad_ff_usage);
-			return 0; 
+			return 0; /* 只要连了手柄，无条件拦截手机震动，和 [source: 5] 逻辑完全一致 */
 		}
 
 		/* ---- 原机马达继续通电 ---- */
-		/* 100% 还原 [source: 6]，没有任何 if (!ff) 毒瘤，保证开机必震！ */
-		if (check_effect_access(ff, code, NULL) == 0)
-			ff->playback(dev, code, value);
+		if (!ff) {
+			printk(KERN_INFO "FF_CORE_DBG: [原生崩溃防御] ff 为 NULL，丢弃指令以防止 0x40 越界!\n");
+			break;
+		}
+
+		if (check_effect_access(ff, code, NULL) == 0) {
+			if (ff->playback) {
+				ff->playback(dev, code, value);
+				printk(KERN_INFO "FF_CORE_DBG: [原生放行] 指令送达手机原机马达\n");
+			} else {
+				printk(KERN_INFO "FF_CORE_DBG: [原生异常] ff->playback 函数指针为空\n");
+			}
+		} else {
+			printk(KERN_INFO "FF_CORE_DBG: [原生拦截] check_effect_access 验证未通过\n");
+		}
 		break;
 	}
 
@@ -402,17 +372,6 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 }
 EXPORT_SYMBOL_GPL(input_ff_event);
 
-/**
- * input_ff_create() - create force-feedback device
- * @dev: input device supporting force-feedback
- * @max_effects: maximum number of effects supported by the device
- *
- * This function allocates all necessary memory for a force feedback
- * portion of an input device and installs all default handlers.
- * @dev->ffbit should be already set up before calling this function.
- * Once ff device is created you need to setup its upload, erase,
- * playback and other handlers before registering input device
- */
 int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 {
 	struct ff_device *ff;
@@ -465,10 +424,10 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 		if (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller")) {
 			WRITE_ONCE(active_gamepad, dev);
 			gamepad_effect_id = -1;
-			/* 【核心修复2】：绝不能立刻上传！延迟 1000 毫秒，等驱动把指针全部挂载完毕 */
+			/* 延迟 1000 毫秒，等驱动把指针全部挂载完毕 */
 			schedule_delayed_work(&gamepad_upload_work, msecs_to_jiffies(1000));
 			register_sysrq_key('v', &sysrq_gamepad_vib_op);
-			printk(KERN_INFO "FF_CORE_PROBE: [成功] 成功抓取手柄设备!\n");
+			printk(KERN_INFO "FF_CORE_DBG: [探针] 成功抓取手柄设备! name=%s\n", dev->name);
 		}
 	}
 
@@ -476,35 +435,25 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 }
 EXPORT_SYMBOL_GPL(input_ff_create);
 
-/**
- * input_ff_destroy() - frees force feedback portion of input device
- * @dev: input device supporting force feedback
- *
- * This function is only needed in error path as input core will
- * automatically free force feedback structures when device is
- * destroyed.
- */
 void input_ff_destroy(struct input_dev *dev)
 {
 	struct ff_device *ff = dev->ff;
 
 	/* ---- 拔掉手柄时释放指针并销毁队列任务 ---- */
 	if (dev == READ_ONCE(active_gamepad)) {
-		/* 瞬间置空，阻断 input_ff_event 再次拿到即将被销毁的指针 */
 		WRITE_ONCE(active_gamepad, NULL);
 		gamepad_effect_id = -1;
 		
-		/* 原地空转等待当前震动周期离开，彻底根除 0x40 释放后使用崩溃，且绝不触发看门狗 */
+		cancel_delayed_work_sync(&gamepad_upload_work);
+		cancel_delayed_work_sync(&gamepad_stop_work);
+		
+		/* 原地空转等待当前震动周期离开 */
 		while (atomic_read(&gamepad_ff_usage) > 0) {
 			cpu_relax();
 		}
 		
-		/* 【核心修复3】：卸载时取消延时上传任务，必须用 sync 等待残留任务死透 */
-		cancel_delayed_work_sync(&gamepad_upload_work);
-		cancel_delayed_work_sync(&gamepad_stop_work);
-		
 		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
-		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
+		printk(KERN_INFO "FF_CORE_DBG: [探针] 手柄已断开连接\n");
 	}
 	
 	__clear_bit(EV_FF, dev->evbit);
@@ -538,10 +487,11 @@ int trigger_gamepad_vib_from_system(int intensity)
 		else cancel_delayed_work(&gamepad_stop_work);
 		
 		atomic_dec(&gamepad_ff_usage);
-		return 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
+		printk(KERN_INFO "FF_CORE_DBG: [系统劫持] ioctl 触发手柄震动成功\n");
+		return 1;
 	}
 	atomic_dec(&gamepad_ff_usage);
-	
-	return 0; /* 手柄没连，放行指令给原机马达 */
+	printk(KERN_INFO "FF_CORE_DBG: [系统劫持] 失败：手柄未连接\n");
+	return 0;
 }
 EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system);
