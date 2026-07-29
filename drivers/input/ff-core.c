@@ -478,4 +478,4 @@ int trigger_gamepad_vib_from_system(int intensity)
 	spin_unlock_irqrestore(&gamepad_hijack_lock, h_flags);
 	return ret; 
 }
-EXPORT_SYMBOL_GPL(input_ff_destroy);
+EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system);
