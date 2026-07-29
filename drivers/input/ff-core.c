@@ -29,7 +29,7 @@ atomic_t gamepad_ff_usage = ATOMIC_INIT(0);
 /* 提前声明劫持接口，防止 SysRq 编译报隐式声明错误 */
 int trigger_gamepad_vib_from_system(int intensity);
 
-/* 【终极修复1】：设立一次性上传延时任务 */
+/* 【终极修复1】：设立一次性上传延时任务，给底层驱动留出 1 秒钟的初始化时间 */
 static void gamepad_upload_worker(struct work_struct *work)
 {
 	struct ff_effect effect;
@@ -39,7 +39,7 @@ static void gamepad_upload_worker(struct work_struct *work)
 	dev = READ_ONCE(active_gamepad);
 	
 	if (!dev || !dev->ff || !dev->ff->upload) {
-		printk(KERN_INFO "FF_CORE_DBG: [手柄初始化] 失败 - 指针为空或 upload 未就绪\n");
+		pr_err("FF_CORE_DBG: [手柄初始化] 失败, 指针为空或未挂载\n");
 		atomic_dec(&gamepad_ff_usage);
 		return;
 	}
@@ -53,9 +53,7 @@ static void gamepad_upload_worker(struct work_struct *work)
 
 	if (input_ff_upload(dev, &effect, (struct file *)1) == 0) {
 		gamepad_effect_id = effect.id;
-		printk(KERN_INFO "FF_CORE_DBG: [手柄初始化] 特效上传成功, ID=%d\n", gamepad_effect_id);
-	} else {
-		printk(KERN_INFO "FF_CORE_DBG: [手柄初始化] 特效上传失败\n");
+		pr_err("FF_CORE_DBG: [手柄初始化] 成功, ID=%d\n", effect.id);
 	}
 	atomic_dec(&gamepad_ff_usage);
 }
@@ -85,7 +83,7 @@ static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
 /* ---- 专属内核调试指令 (SysRq) ---- */
 static void sysrq_handle_gamepad_vib(u8 key)
 {
-	printk(KERN_INFO "FF_CORE_DBG: 收到 SysRq 调试指令，强制触发手柄震动!\n");
+	pr_err("FF_CORE_DBG: 收到 SysRq 调试指令!\n");
 	trigger_gamepad_vib_from_system(1);
 }
 static const struct sysrq_key_op sysrq_gamepad_vib_op = {
@@ -297,41 +295,35 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 	atomic_inc(&gamepad_ff_usage);
 	gp = READ_ONCE(active_gamepad);
 
-	printk(KERN_INFO "FF_CORE_DBG: [收到事件] dev_name=%s, code=%u, value=%d\n",
-	       dev->name ? dev->name : "unknown", code, value);
+	pr_err("FF_CORE_DBG: [进门] dev=%s, code=%u, value=%d\n", dev->name ? dev->name : "unk", code, value);
 
 	switch (code) {
 	case FF_GAIN:
 		if (gp && dev != gp && gp->ff && gp->ff->set_gain) {
 			gp->ff->set_gain(gp, value);
 		}
-		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU) {
-			printk(KERN_INFO "FF_CORE_DBG: [FF_GAIN] 原生拦截 (test_bit 失败)\n");
+		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
-		}
-		if (ff && ff->set_gain) {
-			ff->set_gain(dev, value);
-			printk(KERN_INFO "FF_CORE_DBG: [FF_GAIN] 原生放行\n");
-		}
+		ff->set_gain(dev, value);
 		break;
 
 	case FF_AUTOCENTER:
 		if (!test_bit(FF_AUTOCENTER, dev->ffbit) || value > 0xffffU)
 			break;
-		if (ff && ff->set_autocenter) ff->set_autocenter(dev, value);
+		ff->set_autocenter(dev, value);
 		break;
 
 	default:
 		/* ---- 核心并轨（拦截原生马达，同步驱动手柄） ---- */
+		/* 100% 还原 [source: 4] 的判断条件 */
 		if (gp && dev != gp) {
 			unsigned long flags;
-			printk(KERN_INFO "FF_CORE_DBG: [劫持逻辑] 发现已连接的手柄，准备拦截\n");
+			pr_err("FF_CORE_DBG: [分流] 判定有手柄，进拦截\n");
 			
 			if (gamepad_effect_id != -1 && gp->ff && gp->ff->playback) {
 				spin_lock_irqsave(&gp->event_lock, flags);
 				if (gp->ff && gp->ff->playback) {
 					gp->ff->playback(gp, gamepad_effect_id, value > 0 ? 1 : 0);
-					printk(KERN_INFO "FF_CORE_DBG: [劫持成功] 震动指令已下发至手柄\n");
 				}
 				spin_unlock_irqrestore(&gp->event_lock, flags);
 
@@ -340,30 +332,17 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 				} else {
 					cancel_delayed_work(&gamepad_stop_work);
 				}
-			} else {
-				printk(KERN_INFO "FF_CORE_DBG: [劫持失败] 手柄指针异常或 ID 为 -1\n");
 			}
-			
+			/* 【终极静音防线】：只要手柄连着，就截断指令并返回0，手机绝对不震！ */
 			atomic_dec(&gamepad_ff_usage);
-			return 0; /* 只要连了手柄，无条件拦截手机震动，和 [source: 5] 逻辑完全一致 */
+			return 0; 
 		}
 
 		/* ---- 原机马达继续通电 ---- */
-		if (!ff) {
-			printk(KERN_INFO "FF_CORE_DBG: [原生崩溃防御] ff 为 NULL，丢弃指令以防止 0x40 越界!\n");
-			break;
-		}
-
-		if (check_effect_access(ff, code, NULL) == 0) {
-			if (ff->playback) {
-				ff->playback(dev, code, value);
-				printk(KERN_INFO "FF_CORE_DBG: [原生放行] 指令送达手机原机马达\n");
-			} else {
-				printk(KERN_INFO "FF_CORE_DBG: [原生异常] ff->playback 函数指针为空\n");
-			}
-		} else {
-			printk(KERN_INFO "FF_CORE_DBG: [原生拦截] check_effect_access 验证未通过\n");
-		}
+		/* 100% 还原 [source: 4]，无任何多余判断 */
+		pr_err("FF_CORE_DBG: [放行] 原生马达通电\n");
+		if (check_effect_access(ff, code, NULL) == 0)
+			ff->playback(dev, code, value);
 		break;
 	}
 
@@ -427,7 +406,7 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 			/* 延迟 1000 毫秒，等驱动把指针全部挂载完毕 */
 			schedule_delayed_work(&gamepad_upload_work, msecs_to_jiffies(1000));
 			register_sysrq_key('v', &sysrq_gamepad_vib_op);
-			printk(KERN_INFO "FF_CORE_DBG: [探针] 成功抓取手柄设备! name=%s\n", dev->name);
+			pr_err("FF_CORE_DBG: [探针] 抓取手柄成功! name=%s\n", dev->name);
 		}
 	}
 
@@ -447,13 +426,13 @@ void input_ff_destroy(struct input_dev *dev)
 		cancel_delayed_work_sync(&gamepad_upload_work);
 		cancel_delayed_work_sync(&gamepad_stop_work);
 		
-		/* 原地空转等待当前震动周期离开 */
+		/* 原地空转等待当前震动周期离开，避开空指针 */
 		while (atomic_read(&gamepad_ff_usage) > 0) {
 			cpu_relax();
 		}
 		
 		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
-		printk(KERN_INFO "FF_CORE_DBG: [探针] 手柄已断开连接\n");
+		pr_err("FF_CORE_DBG: [卸载] 手柄安全断开\n");
 	}
 	
 	__clear_bit(EV_FF, dev->evbit);
@@ -471,27 +450,28 @@ void input_ff_destroy(struct input_dev *dev)
 int trigger_gamepad_vib_from_system(int intensity)
 {
 	unsigned long flags;
-	struct input_dev *dev;
+	struct input_dev *gp;
 	
 	atomic_inc(&gamepad_ff_usage);
-	dev = READ_ONCE(active_gamepad);
+	gp = READ_ONCE(active_gamepad);
 	
-	if (dev && gamepad_effect_id != -1 && dev->ff && dev->ff->playback) {
-		spin_lock_irqsave(&dev->event_lock, flags);
-		if (dev->ff && dev->ff->playback) {
-			dev->ff->playback(dev, gamepad_effect_id, intensity > 0 ? 1 : 0);
+	/* 100% 还原 [source: 4] 的判断条件 */
+	if (gp && gamepad_effect_id != -1) {
+		spin_lock_irqsave(&gp->event_lock, flags);
+		if (gp->ff && gp->ff->playback) {
+			gp->ff->playback(gp, gamepad_effect_id, intensity > 0 ? 1 : 0);
 		}
-		spin_unlock_irqrestore(&dev->event_lock, flags);
+		spin_unlock_irqrestore(&gp->event_lock, flags);
 		
 		if (intensity > 0) mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
 		else cancel_delayed_work(&gamepad_stop_work);
 		
 		atomic_dec(&gamepad_ff_usage);
-		printk(KERN_INFO "FF_CORE_DBG: [系统劫持] ioctl 触发手柄震动成功\n");
-		return 1;
+		pr_err("FF_CORE_DBG: [劫持] 触发 ioctl 拦截，返回 1\n");
+		return 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
 	}
 	atomic_dec(&gamepad_ff_usage);
-	printk(KERN_INFO "FF_CORE_DBG: [系统劫持] 失败：手柄未连接\n");
-	return 0;
+	
+	return 0; /* 手柄没连，放行指令给原机马达 */
 }
 EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system);
