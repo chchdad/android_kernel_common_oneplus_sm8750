@@ -21,6 +21,9 @@
 /* ---- 强行变轨全局指针与异步队列 ---- */
 struct input_dev *active_gamepad = NULL;
 static int gamepad_effect_id = -1;
+/* 【跨设备生死锁】：保护手柄指针读写，防断连崩溃 */
+DEFINE_SPINLOCK(active_gamepad_lock);
+atomic_t gamepad_ff_usage = ATOMIC_INIT(0);
 
 /* 提前声明劫持接口，防止 SysRq 编译报隐式声明错误 */
 int trigger_gamepad_vib_from_system(int intensity);
