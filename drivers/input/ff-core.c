@@ -474,4 +474,5 @@ int trigger_gamepad_vib_from_system(int intensity)
 	
 	return 0; /* 手柄没连，放行指令给原机马达 */
 }
+/* 必须保留这两个宏的共同导出！ */
 EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system);
