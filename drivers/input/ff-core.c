@@ -20,57 +20,29 @@
 
 /* ---- 强行变轨全局指针与异步队列 ---- */
 struct input_dev *active_gamepad = NULL;
-static int gamepad_effect_id = -1;
+static int gamepad_effect_id = 0; /* 霸占 0 号特效槽位 */
+DEFINE_SPINLOCK(active_gamepad_lock); /* 生死锁：仅用于极速保护指针读写 */
 
-/* 【无锁防线】：只用原子操作，绝不引入任何自旋锁，避开高通看门狗 */
-atomic_t gamepad_ff_usage = ATOMIC_INIT(0);
-
-/* 提前声明劫持接口，防止 SysRq 编译报隐式声明错误 */
-int trigger_gamepad_vib_from_system(int intensity);
-
-/* 【终极修复1】：设立一次性上传延时任务，给底层驱动留出 1 秒钟的初始化时间 */
-static void gamepad_upload_worker(struct work_struct *work)
-{
-	struct ff_effect effect;
-	/* 1. 缓存指针，防中途变空 */
-	struct input_dev *dev = READ_ONCE(active_gamepad);
-	
-	if (!dev) return;
-
-	atomic_inc(&gamepad_ff_usage);
-	/* 2. 再次确认没被拔掉且函数挂载完整 */
-	if (dev == READ_ONCE(active_gamepad) && dev->ff && dev->ff->upload) {
-		memset(&effect, 0, sizeof(effect));
-		effect.type = FF_RUMBLE;
-		effect.id = -1;
-		effect.u.rumble.strong_magnitude = 0xFFFF;
-		effect.u.rumble.weak_magnitude = 0xFFFF;
-		effect.replay.length = 50; 
-
-		if (input_ff_upload(dev, &effect, (struct file *)1) == 0) {
-			gamepad_effect_id = effect.id;
-		}
-	}
-	atomic_dec(&gamepad_ff_usage);
-}
-static DECLARE_DELAYED_WORK(gamepad_upload_work, gamepad_upload_worker);
-
-/* ---- 强制刹车延时任务 ---- */
+/* ---- 强制刹车延时任务（严守 50ms 协议） ---- */
 static void gamepad_stop_worker(struct work_struct *work)
 {
 	unsigned long flags;
-	struct input_dev *dev = READ_ONCE(active_gamepad); 
-	
-	if (dev && gamepad_effect_id != -1) {
-		atomic_inc(&gamepad_ff_usage);
-		if (dev == READ_ONCE(active_gamepad) && dev->ff && dev->ff->playback) {
-			spin_lock_irqsave(&dev->event_lock, flags);
-			if (dev->ff && dev->ff->playback) {
-				dev->ff->playback(dev, gamepad_effect_id, 0);
-			}
-			spin_unlock_irqrestore(&dev->event_lock, flags);
+	struct input_dev *dev = NULL;
+
+	/* 1. 极速拿锁：只安全获取指针并加护身符，绝不在此调用底层 */
+	spin_lock_irqsave(&active_gamepad_lock, flags);
+	if (active_gamepad) {
+		dev = active_gamepad;
+		input_get_device(dev);
+	}
+	spin_unlock_irqrestore(&active_gamepad_lock, flags);
+
+	/* 2. 锁外执行：高通底层爱怎么睡怎么睡，绝对不死锁！ */
+	if (dev) {
+		if (dev->ff && dev->ff->playback) {
+			dev->ff->playback(dev, gamepad_effect_id, 0);
 		}
-		atomic_dec(&gamepad_ff_usage);
+		input_put_device(dev); /* 执行完，归还护身符 */
 	}
 }
 static DECLARE_DELAYED_WORK(gamepad_stop_work, gamepad_stop_worker);
@@ -89,6 +61,10 @@ static const struct sysrq_key_op sysrq_gamepad_vib_op = {
 	.enable_mask = SYSRQ_ENABLE_DUMP,
 };
 
+/*
+ * Check that the effect_id is a valid effect and whether the user
+ * is the owner
+ */
 static int check_effect_access(struct ff_device *ff, int effect_id,
 				struct file *file)
 {
@@ -102,6 +78,9 @@ static int check_effect_access(struct ff_device *ff, int effect_id,
 	return 0;
 }
 
+/*
+ * Checks whether 2 effects can be combined together
+ */
 static inline int check_effects_compatible(struct ff_effect *e1,
 					   struct ff_effect *e2)
 {
@@ -110,6 +89,9 @@ static inline int check_effects_compatible(struct ff_effect *e1,
 		e1->u.periodic.waveform == e2->u.periodic.waveform);
 }
 
+/*
+ * Convert an effect into compatible one
+ */
 static int compat_effect(struct ff_device *ff, struct ff_effect *effect)
 {
 	int magnitude;
@@ -119,6 +101,10 @@ static int compat_effect(struct ff_device *ff, struct ff_effect *effect)
 		if (!test_bit(FF_PERIODIC, ff->ffbit))
 			return -EINVAL;
 
+		/*
+		 * calculate magnitude of sine wave as average of rumble's
+		 * 2/3 of strong magnitude and 1/3 of weak magnitude
+		 */
 		magnitude = effect->u.rumble.strong_magnitude / 3 +
 			    effect->u.rumble.weak_magnitude / 6;
 
@@ -136,10 +122,17 @@ static int compat_effect(struct ff_device *ff, struct ff_effect *effect)
 		return 0;
 
 	default:
+		/* Let driver handle conversion */
 		return 0;
 	}
 }
 
+/**
+ * input_ff_upload() - upload effect into force-feedback device
+ * @dev: input device
+ * @effect: effect to be uploaded
+ * @file: owner of the effect
+ */
 int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 		    struct file *file)
 {
@@ -216,6 +209,10 @@ int input_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 }
 EXPORT_SYMBOL_GPL(input_ff_upload);
 
+/*
+ * Erases the effect if the requester is also the effect owner. The mutex
+ * should already be locked before calling this function.
+ */
 static int erase_effect(struct input_dev *dev, int effect_id,
 			struct file *file)
 {
@@ -245,6 +242,16 @@ static int erase_effect(struct input_dev *dev, int effect_id,
 	return 0;
 }
 
+/**
+ * input_ff_erase - erase a force-feedback effect from device
+ * @dev: input device to erase effect from
+ * @effect_id: id of the effect to be erased
+ * @file: purported owner of the request
+ *
+ * This function erases a force-feedback effect from specified device.
+ * The effect will only be erased if it was uploaded through the same
+ * file handle that is requesting erase.
+ */
 int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file)
 {
 	struct ff_device *ff = dev->ff;
@@ -261,6 +268,15 @@ int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file)
 }
 EXPORT_SYMBOL_GPL(input_ff_erase);
 
+/*
+ * input_ff_flush - erase all effects owned by a file handle
+ * @dev: input device to erase effect from
+ * @file: purported owner of the effects
+ *
+ * This function erases all force-feedback effects associated with
+ * the given owner from specified device. Note that @file may be %NULL,
+ * in which case all effects will be erased.
+ */
 int input_ff_flush(struct input_dev *dev, struct file *file)
 {
 	struct ff_device *ff = dev->ff;
@@ -279,6 +295,13 @@ int input_ff_flush(struct input_dev *dev, struct file *file)
 }
 EXPORT_SYMBOL_GPL(input_ff_flush);
 
+/**
+ * input_ff_event() - generic handler for force-feedback events
+ * @dev: input device to send the effect to
+ * @type: event type (anything but EV_FF is ignored)
+ * @code: event code
+ * @value: event value
+ */
 int input_ff_event(struct input_dev *dev, unsigned int type,
 		   unsigned int code, int value)
 {
@@ -287,60 +310,45 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 	if (type != EV_FF)
 		return 0;
 
-	/* 【救命防线】：必须拦截原生马达的空指针，防断连时调用此函数越界 0x40 崩溃！ */
-	if (!ff)
-		return 0;
-
 	switch (code) {
 	case FF_GAIN:
-		if (READ_ONCE(active_gamepad) && dev != READ_ONCE(active_gamepad)) {
-			struct input_dev *gp_dev = READ_ONCE(active_gamepad);
-			if (gp_dev) {
-				atomic_inc(&gamepad_ff_usage);
-				if (gp_dev == READ_ONCE(active_gamepad) && gp_dev->ff && gp_dev->ff->set_gain) {
-					gp_dev->ff->set_gain(gp_dev, value);
-				}
-				atomic_dec(&gamepad_ff_usage);
-			}
+		if (active_gamepad && dev != active_gamepad && active_gamepad->ff && active_gamepad->ff->set_gain) {
+			active_gamepad->ff->set_gain(active_gamepad, value);
 		}
 		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
-		if (ff->set_gain) ff->set_gain(dev, value);
+		ff->set_gain(dev, value);
 		break;
 
 	case FF_AUTOCENTER:
 		if (!test_bit(FF_AUTOCENTER, dev->ffbit) || value > 0xffffU)
 			break;
-		if (ff->set_autocenter) ff->set_autocenter(dev, value);
+		ff->set_autocenter(dev, value);
 		break;
 
-	default:
+default:
 		/* ---- 核心并轨（拦截原生马达，同步驱动手柄） ---- */
-		if (READ_ONCE(active_gamepad) && dev != READ_ONCE(active_gamepad)) {
-			struct input_dev *gp_dev = READ_ONCE(active_gamepad);
-			
-			if (gp_dev && gamepad_effect_id != -1) {
-				atomic_inc(&gamepad_ff_usage);
-				/* 二次验证指针存活，确保底层内存未被销毁 */
-				if (gp_dev == READ_ONCE(active_gamepad) && gp_dev->ff && gp_dev->ff->playback) {
-					unsigned long flags;
-					spin_lock_irqsave(&gp_dev->event_lock, flags);
-					if (gp_dev->ff && gp_dev->ff->playback) {
-						gp_dev->ff->playback(gp_dev, gamepad_effect_id, value > 0 ? 1 : 0);
-					}
-					spin_unlock_irqrestore(&gp_dev->event_lock, flags);
+		spin_lock_irqsave(&active_gamepad_lock, flags);
+		if (active_gamepad && dev != active_gamepad) {
+			struct input_dev *gp_dev = active_gamepad;
+			input_get_device(gp_dev); /* 上护身符 */
+			spin_unlock_irqrestore(&active_gamepad_lock, flags); /* 瞬间释放生死锁 */
 
-					if (value > 0) {
-						mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
-					} else {
-						cancel_delayed_work(&gamepad_stop_work);
-					}
-				}
-				atomic_dec(&gamepad_ff_usage);
+			/* 锁外安全调用 */
+			if (gp_dev->ff && gp_dev->ff->playback) {
+				gp_dev->ff->playback(gp_dev, gamepad_effect_id, value > 0 ? 1 : 0);
 			}
-			/* 只要手柄还在，截断指令，手机绝对不震！ */
+
+			if (value > 0) {
+				mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
+			} else {
+				cancel_delayed_work(&gamepad_stop_work);
+			}
+			
+			input_put_device(gp_dev); /* 归还护身符 */
 			return 0; 
 		}
+		spin_unlock_irqrestore(&active_gamepad_lock, flags);
 
 		/* ---- 原机马达继续通电 ---- */
 		if (check_effect_access(ff, code, NULL) == 0)
@@ -352,6 +360,17 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 }
 EXPORT_SYMBOL_GPL(input_ff_event);
 
+/**
+ * input_ff_create() - create force-feedback device
+ * @dev: input device supporting force-feedback
+ * @max_effects: maximum number of effects supported by the device
+ *
+ * This function allocates all necessary memory for a force feedback
+ * portion of an input device and installs all default handlers.
+ * @dev->ffbit should be already set up before calling this function.
+ * Once ff device is created you need to setup its upload, erase,
+ * playback and other handlers before registering input device
+ */
 int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 {
 	struct ff_device *ff;
@@ -369,14 +388,15 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 	}
 
 	ff_dev_size = struct_size(ff, effect_owners, max_effects);
-	if (ff_dev_size == SIZE_MAX)
+	if (ff_dev_size == SIZE_MAX) /* overflow */
 		return -EINVAL;
 
 	ff = kzalloc(ff_dev_size, GFP_KERNEL);
 	if (!ff)
 		return -ENOMEM;
 
-	ff->effects = kcalloc(max_effects, sizeof(struct ff_effect), GFP_KERNEL);
+	ff->effects = kcalloc(max_effects, sizeof(struct ff_effect),
+			      GFP_KERNEL);
 	if (!ff->effects) {
 		kfree(ff);
 		return -ENOMEM;
@@ -390,18 +410,20 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 	dev->event = input_ff_event;
 	__set_bit(EV_FF, dev->evbit);
 
+	/* Copy "true" bits into ff device bitmap */
 	for_each_set_bit(i, dev->ffbit, FF_CNT)
 		__set_bit(i, ff->ffbit);
 
+	/* we can emulate RUMBLE with periodic effects */
 	if (test_bit(FF_PERIODIC, ff->ffbit))
 		__set_bit(FF_RUMBLE, dev->ffbit);
 
 	/* ---- 抓取手柄设备探针 ---- */
 	if (dev->name) {
 		if (strstr(dev->name, "Xbox") || strstr(dev->name, "Controller")) {
-			WRITE_ONCE(active_gamepad, dev);
+			active_gamepad = dev;
 			gamepad_effect_id = -1;
-			
+			/* 【核心修复2】：绝不能立刻上传！延迟 1000 毫秒，等驱动把指针全部挂载完毕 */
 			schedule_delayed_work(&gamepad_upload_work, msecs_to_jiffies(1000));
 			register_sysrq_key('v', &sysrq_gamepad_vib_op);
 			printk(KERN_INFO "FF_CORE_PROBE: [成功] 成功抓取手柄设备!\n");
@@ -412,28 +434,31 @@ int input_ff_create(struct input_dev *dev, unsigned int max_effects)
 }
 EXPORT_SYMBOL_GPL(input_ff_create);
 
+/**
+ * input_ff_destroy() - frees force feedback portion of input device
+ * @dev: input device supporting force feedback
+ *
+ * This function is only needed in error path as input core will
+ * automatically free force feedback structures when device is
+ * destroyed.
+ */
 void input_ff_destroy(struct input_dev *dev)
 {
 	struct ff_device *ff = dev->ff;
+	unsigned long flags;
 
-	/* ---- 拔掉手柄时释放指针并销毁队列任务 ---- */
-	if (dev == READ_ONCE(active_gamepad)) {
-		/* 瞬间置空并写回内存，切断外部的任何新请求 */
-		WRITE_ONCE(active_gamepad, NULL);
-		gamepad_effect_id = -1;
+	/* ---- 拔掉手柄时释放指针 ---- */
+	spin_lock_irqsave(&active_gamepad_lock, flags);
+	if (dev == active_gamepad) {
+		active_gamepad = NULL; /* 切断外部进入的新指令 */
+		spin_unlock_irqrestore(&active_gamepad_lock, flags);
 		
-		/* 必须带 sync！杀掉还在排队和运行的任务防越界 */
-		cancel_delayed_work_sync(&gamepad_upload_work);
+		/* 此时由于已经没有新任务进来，且老任务都有引用计数保护，可以安全地在锁外等待销毁 */
 		cancel_delayed_work_sync(&gamepad_stop_work);
-		
-		/* 【终极避狗防线】：绝不使用 usleep_range 等引发调度的休眠！
-		 * 仅使用 cpu_relax() 原地空转让出流水线，确保安全释核且绝不触发看门狗！ */
-		while (atomic_read(&gamepad_ff_usage) > 0) {
-			cpu_relax();
-		}
-		
 		unregister_sysrq_key('v', &sysrq_gamepad_vib_op);
-		printk(KERN_INFO "FF_CORE: Gamepad disconnected safely\n");
+		printk(KERN_INFO "FF_CORE: Gamepad disconnected\n");
+	} else {
+		spin_unlock_irqrestore(&active_gamepad_lock, flags);
 	}
 	
 	__clear_bit(EV_FF, dev->evbit);
@@ -451,26 +476,36 @@ void input_ff_destroy(struct input_dev *dev)
 int trigger_gamepad_vib_from_system(int intensity)
 {
 	unsigned long flags;
-	struct input_dev *dev = READ_ONCE(active_gamepad);
-	
-	if (dev && gamepad_effect_id != -1) {
-		atomic_inc(&gamepad_ff_usage);
-		if (dev == READ_ONCE(active_gamepad) && dev->ff && dev->ff->playback) {
-			spin_lock_irqsave(&dev->event_lock, flags);
-			if (dev->ff && dev->ff->playback) {
-				dev->ff->playback(dev, gamepad_effect_id, intensity > 0 ? 1 : 0);
-			}
-			spin_unlock_irqrestore(&dev->event_lock, flags);
-			
-			if (intensity > 0) mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
-			else cancel_delayed_work(&gamepad_stop_work);
-			
-			atomic_dec(&gamepad_ff_usage);
-			return 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
-		}
-		atomic_dec(&gamepad_ff_usage);
+	struct input_dev *dev = NULL;
+	int ret = 0;
+
+	/* 1. 极速拿锁：只取指针和上护身符 */
+	spin_lock_irqsave(&active_gamepad_lock, flags);
+	if (active_gamepad) {
+		dev = active_gamepad;
+		input_get_device(dev);
+		ret = 1;
 	}
-	
-	return 0; /* 手柄没连，放行指令给原机马达 */
+	spin_unlock_irqrestore(&active_gamepad_lock, flags);
+
+	/* 2. 锁外捏造特效并调用，完美避开看门狗 */
+	if (dev) {
+		if (dev->ff && dev->ff->playback) {
+			dev->ff->effects[gamepad_effect_id].type = FF_RUMBLE;
+			dev->ff->effects[gamepad_effect_id].u.rumble.strong_magnitude = 0xFFFF;
+			dev->ff->effects[gamepad_effect_id].u.rumble.weak_magnitude = 0xFFFF;
+			dev->ff->effects[gamepad_effect_id].replay.length = 50;
+
+			dev->ff->playback(dev, gamepad_effect_id, intensity > 0 ? 1 : 0);
+		}
+		
+		if (intensity > 0) 
+			mod_delayed_work(system_wq, &gamepad_stop_work, msecs_to_jiffies(50));
+		else 
+			cancel_delayed_work(&gamepad_stop_work);
+			
+		input_put_device(dev); /* 归还护身符 */
+	}
+	return ret;
 }
-EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system); /* 已修复此处的笔误 */
+EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system);
