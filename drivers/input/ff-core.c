@@ -29,7 +29,7 @@ atomic_t gamepad_ff_usage = ATOMIC_INIT(0);
 /* 提前声明劫持接口，防止 SysRq 编译报隐式声明错误 */
 int trigger_gamepad_vib_from_system(int intensity);
 
-/* 【终极修复1】：设立一次性上传延时任务，给底层驱动留出 1 秒钟的初始化时间 */
+/* 【终极修复1】：设立一次性上传延时任务 */
 static void gamepad_upload_worker(struct work_struct *work)
 {
 	struct ff_effect effect;
@@ -304,18 +304,19 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		}
 		if (!test_bit(FF_GAIN, dev->ffbit) || value > 0xffffU)
 			break;
-		ff->set_gain(dev, value);
+		if (ff && ff->set_gain)
+			ff->set_gain(dev, value);
 		break;
 
 	case FF_AUTOCENTER:
 		if (!test_bit(FF_AUTOCENTER, dev->ffbit) || value > 0xffffU)
 			break;
-		ff->set_autocenter(dev, value);
+		if (ff && ff->set_autocenter)
+			ff->set_autocenter(dev, value);
 		break;
 
 	default:
 		/* ---- 核心并轨（拦截原生马达，同步驱动手柄） ---- */
-		/* 100% 还原 [source: 4] 的判断条件 */
 		if (gp && dev != gp) {
 			unsigned long flags;
 			pr_err("FF_CORE_DBG: [分流] 判定有手柄，进拦截\n");
@@ -339,10 +340,18 @@ int input_ff_event(struct input_dev *dev, unsigned int type,
 		}
 
 		/* ---- 原机马达继续通电 ---- */
-		/* 100% 还原 [source: 4]，无任何多余判断 */
-		pr_err("FF_CORE_DBG: [放行] 原生马达通电\n");
-		if (check_effect_access(ff, code, NULL) == 0)
-			ff->playback(dev, code, value);
+		pr_err("FF_CORE_DBG: [放行] 准备送往原生马达\n");
+		if (!ff) {
+			pr_err("FF_CORE_DBG: [原生崩溃防御] ff 为 NULL, 成功规避 0x40 越界!\n");
+			break;
+		}
+
+		if (check_effect_access(ff, code, NULL) == 0) {
+			if (ff->playback) {
+				ff->playback(dev, code, value);
+				pr_err("FF_CORE_DBG: [原生放行] 马达正常震动\n");
+			}
+		}
 		break;
 	}
 
@@ -426,7 +435,7 @@ void input_ff_destroy(struct input_dev *dev)
 		cancel_delayed_work_sync(&gamepad_upload_work);
 		cancel_delayed_work_sync(&gamepad_stop_work);
 		
-		/* 原地空转等待当前震动周期离开，避开空指针 */
+		/* 原地空转等待当前震动周期离开，彻底切除 UAF 崩溃 */
 		while (atomic_read(&gamepad_ff_usage) > 0) {
 			cpu_relax();
 		}
@@ -445,6 +454,8 @@ void input_ff_destroy(struct input_dev *dev)
 		dev->ff = NULL;
 	}
 }
+/* 【复活关键】：系统命根子级导出，绝对不能删！ */
+EXPORT_SYMBOL_GPL(input_ff_destroy);
 
 /* ---- 暴露给原机马达驱动的劫持接口 ---- */
 int trigger_gamepad_vib_from_system(int intensity)
@@ -455,7 +466,6 @@ int trigger_gamepad_vib_from_system(int intensity)
 	atomic_inc(&gamepad_ff_usage);
 	gp = READ_ONCE(active_gamepad);
 	
-	/* 100% 还原 [source: 4] 的判断条件 */
 	if (gp && gamepad_effect_id != -1) {
 		spin_lock_irqsave(&gp->event_lock, flags);
 		if (gp->ff && gp->ff->playback) {
@@ -467,12 +477,12 @@ int trigger_gamepad_vib_from_system(int intensity)
 		else cancel_delayed_work(&gamepad_stop_work);
 		
 		atomic_dec(&gamepad_ff_usage);
-		pr_err("FF_CORE_DBG: [劫持] 触发 ioctl 拦截，返回 1\n");
-		return 1; /* 告诉 ioctl 拦截器：我已接管，把手机马达掐断！ */
+		pr_err("FF_CORE_DBG: [劫持] ioctl 触发成功，返回 1 掐断原机\n");
+		return 1;
 	}
 	atomic_dec(&gamepad_ff_usage);
 	
-	return 0; /* 手柄没连，放行指令给原机马达 */
+	return 0;
 }
 /* 必须保留这两个宏的共同导出！ */
 EXPORT_SYMBOL_GPL(trigger_gamepad_vib_from_system);
